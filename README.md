@@ -1,6 +1,8 @@
 # DucoBox-ESPHome
 DucoBox ESPHome component based on the work of [arnemauer/Ducobox-ESPEasy-Plugin](https://github.com/arnemauer/Ducobox-ESPEasy-Plugin/). It uses native ESPHome components where possible, e.g. UART, SPI, CC1101. It was tested with a DucoBox Silent. It should work with other DucoBoxes that were supported by the ESPEasy plugin.
 
+*Note: this ESPHome implementation uses the GDO0 pin of the CC1101 instead of the GDO2 pin used by the ESPEasy plugin.*
+
 ## Example configurations
 - `ducobox.yaml`: full gateway + RF example (ESP32 active, ESP8266 alternative commented in-file).
 - `ducobox-simple.yaml`: simplified full gateway + RF example (ESP32 active, ESP8266 alternative commented in-file).
