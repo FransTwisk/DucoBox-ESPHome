@@ -92,6 +92,39 @@ Each node may only appear once. If a `nodeparaget` command times out, the remain
 
 The older single-node keys still work and are converted into `ext_sensors` entries: `ext_sensor_node` (default 3) with `ext_co2_sensor` and `ext_temperature_sensor`, and `rh_sensor_node` (default 4) with `ext_humidity_sensor`. They can't be combined with `ext_sensors` in the same configuration.
 
+## Box information (fans, temperatures, bypass, filter, warnings)
+Newer boxes such as the DucoBox Energy (Premium) report more through their serial console than the `Network` table. `duco_gateway` reads these with a few info commands, every `info_poll_interval` (default 60s, and once right after boot). Only the commands for which you configure a sensor are sent:
+
+| Key | Type | Command | Value |
+|-----|------|---------|-------|
+| `exhaust_fan_speed_sensor`, `supply_fan_speed_sensor` | sensor | `FanInfo` | Fan speed in rpm (filtered) |
+| `outdoor_temperature_sensor`, `supply_temperature_sensor`, `extract_temperature_sensor`, `exhaust_temperature_sensor` | sensor | `TemperatureInfo` | Air temperatures in °C: outdoor air (ODA), supply air into the house (SUP), extract air from the house (ETA), exhaust air to outside (EHA). No value while the box reports a sensor as not OK |
+| `bypass_position_sensor` | sensor | `BypassInfo` | Bypass position in %. 0 % means the bypass is closed, so all air passes the heat exchanger |
+| `bypass_target_temperature_sensor` | sensor | `BypassInfo` | Temperature the bypass control aims for, °C |
+| `exhaust_pressure_sensor`, `supply_pressure_sensor` | sensor | `FanCtrlInfo` | Pressure in Pa |
+| `frost_protection_text_sensor` | text sensor | `FreezeProtectInfo` | Frost protection state, e.g. `INACTIVE` |
+| `heater_level_sensor` | sensor | `FreezeProtectInfo` | Frost protection heater level in % |
+| `warnings_text_sensor` | text sensor | `StatusMonitorInfo` | Active warnings, e.g. `Replace filters (warning)`, or `None` |
+| `problem_binary_sensor` | binary sensor | `StatusMonitorInfo` | On while any warning is active |
+| `filter_warning_binary_sensor` | binary sensor | `StatusMonitorInfo` | On while a filter warning is active |
+| `filter_remaining_days_sensor`, `filter_remaining_percent_sensor` | sensor | `FilterInfo` | Remaining filter lifetime in days and % |
+| `device_time_text_sensor` | text sensor | `RtcGetTime` | The box's clock as it prints it, e.g. `SATURDAY 12/02/2124 13:36:32` |
+
+If the box answers `Unknown Cmd` to one of these commands (or to `fanspeed`, which the Energy boxes don't have), it is not sent again until the next reboot, and a warning is logged.
+
+Zone valves (`VLV` nodes in the `Network` table) can report their own mode and percentage. The zone valve of a controller is shown in its `asso` column:
+
+```yaml
+duco_gateway:
+  # ...
+  zones:
+    - node: 67                       # Bedroom zone valve
+      ventilation_mode: bedroom_zone_mode          # text sensor, e.g. AUTO / MAN2
+      ventilation_percentage: bedroom_zone_percentage
+```
+
+The `Network` reply is about 1.5 KB. Set `rx_buffer_size: 2048` on the `uart` used by `duco_gateway`; with ESPHome's default of 256 bytes the start of a reply can get lost. A `Network` table with a damaged header is skipped instead of being read from the wrong columns.
+
 ## Taking over an existing pairing
 Instead of pairing again, you can configure the network ID and device address of an existing pairing in `duco_rf`, e.g. the values shown in the ESPEasy Duco RF gateway plugin settings ("Network ID (HEX)" and "Device Address"):
 
