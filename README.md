@@ -125,6 +125,54 @@ duco_gateway:
 
 The `Network` reply is about 1.5 KB. Set `rx_buffer_size: 2048` on the `uart` used by `duco_gateway`; with ESPHome's default of 256 bytes the start of a reply can get lost. A `Network` table with a damaged header is skipped instead of being read from the wrong columns.
 
+## Settings
+Some box settings can be changed from Home Assistant through the serial gateway (tested on a DucoBox Energy Premium). A change is queued and written with the box's own `...Set` command; afterwards the value is read back from the box, and the entity always shows the value the box reports. If the box rejects a value, the entity keeps showing the current one. Settings are also read back every `settings_poll_interval` (default 1h), so changes made on the box or in the Duco app show up too.
+
+```yaml
+duco_gateway:
+  # ...
+  time_id: ha_time              # keep the box clock right
+  settings_poll_interval: 1h
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+select:
+  - platform: duco_gateway
+    type: bypass_mode
+    name: "Bypass Mode"
+
+number:
+  - platform: duco_gateway
+    type: co2_setpoint
+    node: 3                     # CO2 controller
+    name: "Bedroom CO2 Setpoint"
+  - platform: duco_gateway
+    type: comfort_temperature
+    zone: 1
+    name: "Comfort Temperature Zone 1"
+  - platform: duco_gateway
+    type: manual_1
+    node: 1                     # the box; zone valves have their own levels (e.g. 67, 68)
+    name: "Box Speed 1 Level"
+```
+
+| Platform / `type` | Target | Box command | Range |
+|---|---|---|---|
+| select `bypass_mode` | – | `BypassParaSet 0 <n>` | `Auto`, `Closed (heat recovery)`, `Open (bypass)` |
+| number `co2_setpoint` | `node` | `NodeConfigSet <node> 4` | 400–2000 ppm |
+| number `comfort_temperature` | `zone` (1 or 2) | `SettingsParaSet 5/6` | 15–30 °C |
+| number `manual_1`, `manual_2`, `manual_3` | `node` | `NodeConfigSet <node> 7/8/9` | % for speed 1 (0–50), 2 (15–100), 3 (50–100) |
+| number `manual_timeout` | `node` | `NodeConfigSet <node> 10` | 5–9995 min: how long a manual speed lasts |
+| number `auto_min`, `auto_max` | `node` | `NodeConfigSet <node> 1/2` | 10–100 %: range in automatic mode |
+
+`Closed (heat recovery)` keeps the bypass closed so all air passes the heat exchanger; `Open (bypass)` opens it fully. In `Auto` the box moves the bypass gradually (about 5 % every 2 minutes), so it can take a while to settle after switching back.
+
+With `time_id`, the box clock is set from that time source once it is valid after boot, and daily from 04:00 (so daylight saving changes are followed). A wrong box clock can make the filter lifetime count wrong: on a box whose clock had drifted to the year 2124, `FilterInfo` reported 0 days left and raised "Replace filters" until the clock was set.
+
+After a write the box sometimes ignores a command sent right away, so the gateway waits 1.5 seconds before the next one. Use `mode: box` on the numbers to avoid accidental changes from a slider.
+
 ## Taking over an existing pairing
 Instead of pairing again, you can configure the network ID and device address of an existing pairing in `duco_rf`, e.g. the values shown in the ESPEasy Duco RF gateway plugin settings ("Network ID (HEX)" and "Device Address"):
 
