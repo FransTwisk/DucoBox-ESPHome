@@ -4,6 +4,10 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
+
+#include <cmath>
+#include <strings.h>
 
 namespace esphome {
 namespace duco_gateway {
@@ -61,12 +65,45 @@ struct ExtSensorNode {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Zones (zone valve nodes, e.g. VLV): mode and % from their row in the Network table
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr uint8_t MAX_ZONES = 4;  // Keep in sync with __init__.py
+
+struct Zone {
+  uint8_t                  node       {0};
+  text_sensor::TextSensor *mode       {nullptr};
+  sensor::Sensor          *percentage {nullptr};
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Info commands, polled every info_poll_interval (DucoBox Energy; other boxes
+// may answer "Unknown Cmd", after which that command is no longer sent).
+// Most of these replies have no "Done" line, so a reply is considered complete
+// after INFO_QUIET_MS without new data.
+// ─────────────────────────────────────────────────────────────────────────────
+enum InfoCmd : uint8_t {
+  INFO_FAN,          // FanInfo            → exhaust / supply fan speed
+  INFO_TEMPERATURE,  // TemperatureInfo    → ODA / SUP / ETA / EHA air temperatures
+  INFO_BYPASS,       // BypassInfo         → bypass position, requested temperature
+  INFO_FAN_CTRL,     // FanCtrlInfo        → exhaust / supply pressure
+  INFO_FREEZE,       // FreezeProtectInfo  → frost protection state, heater level
+  INFO_STATUS,       // StatusMonitorInfo  → active warnings
+  INFO_FILTER,       // FilterInfo         → filter remaining days / %
+  INFO_RTC,          // RtcGetTime         → box clock
+  INFO_COUNT,
+};
+
+static const char *const INFO_COMMANDS[INFO_COUNT] = {
+    "FanInfo", "TemperatureInfo", "BypassInfo", "FanCtrlInfo",
+    "FreezeProtectInfo", "StatusMonitorInfo", "FilterInfo", "RtcGetTime"};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Phase state machine
 //
 // IDLE → LOGLEVEL → NETWORK → SENSORINFO → NODEPARA (for each ext node:
-//        CO2 → TEMP → RH) → FANSPEED → IDLE
+//        CO2 → TEMP → RH) → FANSPEED → INFO (each info command, when due) → IDLE
 //
-// Phases and parameters that have no sensor configured are skipped automatically.
+// Phases, parameters and info commands that have no sensor configured are skipped automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 enum SerialPhase {
   PH_IDLE,
@@ -76,6 +113,7 @@ enum SerialPhase {
   PH_NODEPARA,      // nodeparaget <node> <param> for ext_sensors_[ext_idx_], param ext_param_
   PH_CUSTOM,        // command entered from HA text entity
   PH_FANSPEED,      // fanspeed → RPM
+  PH_INFO,          // INFO_COMMANDS[info_idx_]
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +140,39 @@ class DucoGateway : public Component, public uart::UARTDevice {
   void set_box_humidity_sensor(sensor::Sensor *s)            { box_rh_ = s; }
   void set_vent_mode_text_sensor(text_sensor::TextSensor *s) { vent_mode_txt_ = s; }
   void set_poll_interval_ms(uint32_t ms)                     { poll_interval_ms_ = ms; }
+  void set_info_poll_interval_ms(uint32_t ms)                { info_poll_interval_ms_ = ms; }
+
+  // Either mode or percentage may be nullptr.
+  void add_zone(uint8_t node, text_sensor::TextSensor *mode, sensor::Sensor *percentage) {
+    if (zone_count_ >= MAX_ZONES) {
+      ESP_LOGE(TAG, "Too many zones (max %u); ignoring node %u", MAX_ZONES, node);
+      return;
+    }
+    Zone &z = zones_[zone_count_++];
+    z.node = node;
+    z.mode = mode;
+    z.percentage = percentage;
+  }
+
+  // Info command sensors
+  void set_exhaust_fan_speed_sensor(sensor::Sensor *s)               { exhaust_fan_speed_ = s; }
+  void set_supply_fan_speed_sensor(sensor::Sensor *s)                { supply_fan_speed_ = s; }
+  void set_outdoor_temperature_sensor(sensor::Sensor *s)             { temp_oda_ = s; }
+  void set_supply_temperature_sensor(sensor::Sensor *s)              { temp_sup_ = s; }
+  void set_extract_temperature_sensor(sensor::Sensor *s)             { temp_eta_ = s; }
+  void set_exhaust_temperature_sensor(sensor::Sensor *s)             { temp_eha_ = s; }
+  void set_bypass_position_sensor(sensor::Sensor *s)                 { bypass_position_ = s; }
+  void set_bypass_target_temperature_sensor(sensor::Sensor *s)       { bypass_target_temp_ = s; }
+  void set_exhaust_pressure_sensor(sensor::Sensor *s)                { exhaust_pressure_ = s; }
+  void set_supply_pressure_sensor(sensor::Sensor *s)                 { supply_pressure_ = s; }
+  void set_frost_protection_text_sensor(text_sensor::TextSensor *s)  { frost_state_txt_ = s; }
+  void set_heater_level_sensor(sensor::Sensor *s)                    { heater_level_ = s; }
+  void set_warnings_text_sensor(text_sensor::TextSensor *s)          { warnings_txt_ = s; }
+  void set_problem_binary_sensor(binary_sensor::BinarySensor *s)     { problem_ = s; }
+  void set_filter_warning_binary_sensor(binary_sensor::BinarySensor *s) { filter_warning_ = s; }
+  void set_filter_remaining_days_sensor(sensor::Sensor *s)           { filter_days_ = s; }
+  void set_filter_remaining_percent_sensor(sensor::Sensor *s)        { filter_pct_ = s; }
+  void set_device_time_text_sensor(text_sensor::TextSensor *s)       { device_time_txt_ = s; }
 
   // Request an immediate network dump with all discovered nodes in logs.
   void log_all_nodes() {
@@ -184,6 +255,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
  protected:
   static constexpr const char *TAG               = "duco_serial";
   static constexpr uint32_t    CMD_TIMEOUT_MS    = 8000;   // Should be enough even for slow responses, but short enough to recover from errors. Ducobox is usually very fast (responds in <100ms) but can be slow when the network table grows large or communication is bad with one of the nodes. Duco fails the command after roughly 5 seconds, but we set a slightly longer timeout here to also cover the case where we miss the "Failed" response.
+  static constexpr uint32_t    INFO_QUIET_MS     = 300;    // Info reply complete after this long without data (the box prints a whole reply in well under 100 ms)
 
   SerialPhase phase_        {PH_IDLE};
   uint32_t    cmd_sent_ms_  {0};
@@ -198,8 +270,21 @@ class DucoGateway : public Component, public uart::UARTDevice {
   bool        nodeparaget_in_flight_{false};
   bool        phase_timed_out_{false};
   bool        custom_command_requested_{false};
+  bool        fanspeed_unsupported_{false};
   uint32_t    poll_interval_ms_{15000};
+  uint16_t    reply_lines_  {0};   // Lines received for the current command (including the echo)
   char        custom_command_[128] {0};
+
+  // Info commands
+  uint32_t    info_poll_interval_ms_{60000};
+  uint32_t    last_info_poll_ms_ {0};
+  bool        info_polled_       {false};
+  uint8_t     info_idx_          {0};    // InfoCmd currently in flight
+  uint8_t     info_unsupported_  {0};    // Bit per InfoCmd: box answered "Unknown Cmd"
+  uint8_t     fan_section_       {0};    // FanInfo: 1 = exhaust, 2 = supply
+  uint8_t     status_rows_       {0};    // StatusMonitorInfo: item rows seen
+  bool        status_filter_     {false};
+  char        status_active_[128] {0};   // StatusMonitorInfo: "item (level), ..."
 
   // Network table column indices (resolved from header row)
   uint8_t col_stat_   {255};
@@ -224,6 +309,28 @@ class DucoGateway : public Component, public uart::UARTDevice {
   sensor::Sensor          *box_rh_       {nullptr};
   text_sensor::TextSensor *vent_mode_txt_{nullptr};
 
+  Zone    zones_[MAX_ZONES];
+  uint8_t zone_count_ {0};
+
+  sensor::Sensor              *exhaust_fan_speed_ {nullptr};
+  sensor::Sensor              *supply_fan_speed_  {nullptr};
+  sensor::Sensor              *temp_oda_          {nullptr};
+  sensor::Sensor              *temp_sup_          {nullptr};
+  sensor::Sensor              *temp_eta_          {nullptr};
+  sensor::Sensor              *temp_eha_          {nullptr};
+  sensor::Sensor              *bypass_position_   {nullptr};
+  sensor::Sensor              *bypass_target_temp_{nullptr};
+  sensor::Sensor              *exhaust_pressure_  {nullptr};
+  sensor::Sensor              *supply_pressure_   {nullptr};
+  text_sensor::TextSensor     *frost_state_txt_   {nullptr};
+  sensor::Sensor              *heater_level_      {nullptr};
+  text_sensor::TextSensor     *warnings_txt_      {nullptr};
+  binary_sensor::BinarySensor *problem_           {nullptr};
+  binary_sensor::BinarySensor *filter_warning_    {nullptr};
+  sensor::Sensor              *filter_days_       {nullptr};
+  sensor::Sensor              *filter_pct_        {nullptr};
+  text_sensor::TextSensor     *device_time_txt_   {nullptr};
+
   // ── Serial helpers ────────────────────────────────────────────────────────
   bool is_nodeparaget_phase_(SerialPhase p) const {
     return p == PH_NODEPARA;
@@ -242,6 +349,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
 
     flush_rx();
     line_pos_    = 0;
+    reply_lines_ = 0;
     got_done_    = false;
     had_rx_      = false;
     phase_timed_out_ = false;
@@ -282,6 +390,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
       if (c == '\r' || c == '\n') {
         if (line_pos_ > 0) {
           line_buf_[line_pos_] = '\0';
+          reply_lines_++;
           process_line(line_buf_);
           line_pos_ = 0;
         }
@@ -290,6 +399,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
           line_buf_[line_pos_++] = c;
       }
     }
+
+    // Info replies mostly have no "Done": complete once more than the echo has
+    // arrived and the box has been quiet for a moment.
+    if (!got_done_ && phase_ == PH_INFO && reply_lines_ >= 2 && (millis() - last_rx_ms_) >= INFO_QUIET_MS)
+      got_done_ = true;
 
     if (got_done_) advance_phase();
   }
@@ -309,11 +423,22 @@ class DucoGateway : public Component, public uart::UARTDevice {
         got_done_ = true;
         return;
       }
+      if (strstr(line, "Unknown Cmd") != nullptr) {
+        ESP_LOGW(TAG, "CMD << Unknown Cmd");
+        got_done_ = true;
+        return;
+      }
 
       ESP_LOGI(TAG, "CMD << %s", line);
       return;
     }
 
+    // The box answers "^" / "Unknown Cmd" (no Done/Failed) to commands it doesn't have
+    if (strstr(line, "Unknown Cmd") != nullptr) {
+      mark_unsupported_();
+      got_done_ = true;
+      return;
+    }
     if (strstr(line, "Done") != nullptr) { got_done_ = true; return; }
     if (strstr(line, "Failed") != nullptr) {
       ESP_LOGW(TAG, "Command failed in phase %d", (int) phase_);
@@ -345,9 +470,14 @@ class DucoGateway : public Component, public uart::UARTDevice {
         if (log_all_nodes_active_) {
           ESP_LOGI(TAG, "Node %d: %s", node, line);
         }
-        // Keep existing behavior: only node 1 updates box-level sensors
+        // Node 1 (the box) updates the box-level sensors, zone nodes their zone sensors
         if (node == 1) {
-          parse_network_row(line);
+          parse_network_row(line, vent_mode_, vent_mode_txt_, vent_pct_, countdown_);
+        } else {
+          for (uint8_t i = 0; i < zone_count_; i++) {
+            if (zones_[i].node == node)
+              parse_network_row(line, nullptr, zones_[i].mode, zones_[i].percentage, nullptr);
+          }
         }
       }
       return;
@@ -370,7 +500,8 @@ class DucoGateway : public Component, public uart::UARTDevice {
           ESP_LOGD(TAG, "sensorinfo RH raw=%u -> %.2f%%", raw, rh);
           if (box_rh_) box_rh_->publish_state(rh);
         }
-      } else if (strncmp(line, "  TEMP", 6) == 0) {
+      } else if (strncmp(line, "  TEMP", 6) == 0 && strstr(line, "ADJUST") == nullptr) {
+        // "TEMP ADJUST." is a temperature offset setting, printed even without a box sensor
         const char *colon = strchr(line, ':');
         if (colon && sscanf(colon+1, " %u", &raw) == 1) {
           float temp = (float)raw / 10.0f;
@@ -413,12 +544,200 @@ class DucoGateway : public Component, public uart::UARTDevice {
       }
       return;
     }
+
+    if (phase_ == PH_INFO) {
+      parse_info_line_(line);
+      return;
+    }
+  }
+
+  // Box answered "Unknown Cmd": stop sending a command it doesn't have.
+  void mark_unsupported_() {
+    if (phase_ == PH_FANSPEED) {
+      fanspeed_unsupported_ = true;
+      ESP_LOGW(TAG, "Box doesn't support \"fanspeed\"; fan_speed_sensor won't update");
+    } else if (phase_ == PH_INFO) {
+      info_unsupported_ |= (1u << info_idx_);
+      ESP_LOGW(TAG, "Box doesn't support \"%s\"; its sensors won't update", INFO_COMMANDS[info_idx_]);
+    } else {
+      ESP_LOGW(TAG, "Unknown command in phase %d", (int) phase_);
+    }
+  }
+
+  // ── Info command parsers ──────────────────────────────────────────────────
+  static const char *skip_spaces_(const char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+  }
+
+  static bool starts_with_(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+  }
+
+  // Copy s without leading/trailing whitespace into buf
+  static void copy_trimmed_(char *buf, size_t size, const char *s) {
+    s = skip_spaces_(s);
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    if (n >= size) n = size - 1;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+  }
+
+  void parse_info_line_(const char *line) {
+    const char *s = skip_spaces_(line);
+    const char *colon = strchr(s, ':');
+    int v = 0;
+
+    switch (info_idx_) {
+      case INFO_FAN:
+        // "FanSpeed Exhaust:" / "FanSpeed Supply:" start a section; then "- Filtered :  307 [rpm]"
+        if (starts_with_(s, "FanSpeed Exhaust")) {
+          fan_section_ = 1;
+        } else if (starts_with_(s, "FanSpeed Supply")) {
+          fan_section_ = 2;
+        } else if (starts_with_(s, "- Filtered") && colon && sscanf(colon + 1, "%d", &v) == 1) {
+          sensor::Sensor *t = fan_section_ == 1 ? exhaust_fan_speed_ : fan_section_ == 2 ? supply_fan_speed_ : nullptr;
+          ESP_LOGD(TAG, "FanInfo %s=%d rpm", fan_section_ == 1 ? "exhaust" : "supply", v);
+          if (t) t->publish_state((float) v);
+        }
+        break;
+
+      case INFO_TEMPERATURE:
+        // "- SENSOR ETA:   20.0 [C]  (OK)"
+        if (starts_with_(s, "- SENSOR ") && colon) {
+          const char *code = s + 9;
+          sensor::Sensor *t = starts_with_(code, "ODA") ? temp_oda_ : starts_with_(code, "SUP") ? temp_sup_
+                            : starts_with_(code, "ETA") ? temp_eta_ : starts_with_(code, "EHA") ? temp_eha_ : nullptr;
+          float temp = 0;
+          if (sscanf(colon + 1, "%f", &temp) == 1) {
+            bool ok = strstr(colon, "(OK)") != nullptr;
+            ESP_LOGD(TAG, "TemperatureInfo %.3s=%.1f C%s", code, temp, ok ? "" : " (sensor not OK)");
+            if (t) t->publish_state(ok ? temp : NAN);
+          }
+        }
+        break;
+
+      case INFO_BYPASS:
+        // "- Bypass position : 0 [%]" / "- Requested temperature : 213 [.1°C]"
+        if (colon && sscanf(colon + 1, "%d", &v) == 1) {
+          if (starts_with_(s, "- Bypass position")) {
+            ESP_LOGD(TAG, "BypassInfo position=%d%%", v);
+            if (bypass_position_) bypass_position_->publish_state((float) v);
+          } else if (starts_with_(s, "- Requested temperature")) {
+            ESP_LOGD(TAG, "BypassInfo requested temperature=%.1f C", v / 10.0f);
+            if (bypass_target_temp_) bypass_target_temp_->publish_state(v / 10.0f);
+          }
+        }
+        break;
+
+      case INFO_FAN_CTRL:
+        // "p exhaust:   105 dPa" / "p supply:    27 dPa" (published in Pa)
+        if (colon && sscanf(colon + 1, "%d", &v) == 1) {
+          if (starts_with_(s, "p exhaust:")) {
+            ESP_LOGD(TAG, "FanCtrlInfo exhaust pressure=%.1f Pa", v / 10.0f);
+            if (exhaust_pressure_) exhaust_pressure_->publish_state(v / 10.0f);
+          } else if (starts_with_(s, "p supply:")) {
+            ESP_LOGD(TAG, "FanCtrlInfo supply pressure=%.1f Pa", v / 10.0f);
+            if (supply_pressure_) supply_pressure_->publish_state(v / 10.0f);
+          }
+        }
+        break;
+
+      case INFO_FREEZE:
+        // "State : INACTIVE" / "Heater level : 0"
+        if (colon && starts_with_(s, "State ")) {
+          char state[24];
+          copy_trimmed_(state, sizeof(state), colon + 1);
+          ESP_LOGD(TAG, "FreezeProtectInfo state=%s", state);
+          if (frost_state_txt_) frost_state_txt_->publish_state(state);
+        } else if (colon && starts_with_(s, "Heater level") && sscanf(colon + 1, "%d", &v) == 1) {
+          ESP_LOGD(TAG, "FreezeProtectInfo heater level=%d%%", v);
+          if (heater_level_) heater_level_->publish_state((float) v);
+        }
+        break;
+
+      case INFO_STATUS:
+        parse_status_row_(s);
+        break;
+
+      case INFO_FILTER: {
+        // "Remaining lifetime : 0 days (0%)"
+        int pct = 0;
+        if (colon && starts_with_(s, "Remaining lifetime") && sscanf(colon + 1, "%d days (%d%%)", &v, &pct) == 2) {
+          ESP_LOGD(TAG, "FilterInfo remaining=%d days (%d%%)", v, pct);
+          if (filter_days_) filter_days_->publish_state((float) v);
+          if (filter_pct_) filter_pct_->publish_state((float) pct);
+        }
+        break;
+      }
+
+      case INFO_RTC:
+        // "[RTC] SATURDAY 12/02/2124 13:36:32" (published as printed, without "[RTC]")
+        if (starts_with_(s, "[RTC]")) {
+          char time_str[40];
+          copy_trimmed_(time_str, sizeof(time_str), s + 5);
+          ESP_LOGD(TAG, "RtcGetTime %s", time_str);
+          if (device_time_txt_) device_time_txt_->publish_state(time_str);
+        }
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  // StatusMonitorInfo row: "9     | Replace filters              | 09.19.01 | 3     | warning"
+  // An item is active when its level is not "-".
+  void parse_status_row_(const char *s) {
+    int index = 0;
+    if (sscanf(s, "%d", &index) != 1) return;  // header row
+
+    char buf[96];
+    copy_trimmed_(buf, sizeof(buf), s);
+    char *fields[5] = {nullptr};
+    uint8_t n = 0;
+    for (char *tok = strtok(buf, "|"); tok != nullptr && n < 5; tok = strtok(nullptr, "|")) {
+      while (*tok == ' ') tok++;
+      char *end = tok + strlen(tok);
+      while (end > tok && end[-1] == ' ') *--end = '\0';
+      fields[n++] = tok;
+    }
+    if (n < 5) return;
+
+    status_rows_++;
+    const char *item = fields[1], *level = fields[4];
+    if (strcmp(level, "-") == 0) return;
+
+    ESP_LOGD(TAG, "StatusMonitorInfo active: %s (%s, code %s, count %s)", item, level, fields[2], fields[3]);
+    size_t used = strlen(status_active_);
+    snprintf(status_active_ + used, sizeof(status_active_) - used, "%s%s (%s)", used ? ", " : "", item, level);
+    if (strstr(item, "filter") != nullptr || strstr(item, "Filter") != nullptr) status_filter_ = true;
+  }
+
+  // Called when an info command has finished (Done, quiet or timeout)
+  void finish_info_() {
+    if (info_idx_ == INFO_STATUS && status_rows_ > 0) {
+      bool active = status_active_[0] != '\0';
+      if (warnings_txt_) warnings_txt_->publish_state(active ? status_active_ : "None");
+      if (problem_) problem_->publish_state(active);
+      if (filter_warning_) filter_warning_->publish_state(status_filter_);
+    }
   }
 
   // ── Network header parser ─────────────────────────────────────────────────
   // Finds column positions of stat / %dbt / cval / cntdwn in the pipe-delimited header
   void parse_network_header(const char *line) {
     col_stat_ = col_dbt_ = col_cval_ = col_cntdwn_ = 255;
+
+    // The header starts with the node column. If it doesn't, the start of the
+    // reply was lost (e.g. serial buffer overflow) and every column index would
+    // be off, so skip the table rather than publish values from wrong columns.
+    if (strncasecmp(skip_spaces_(line), "node", 4) != 0) {
+      ESP_LOGW(TAG, "Incomplete Network header (start of reply lost); skipping this table");
+      return;
+    }
+
     char buf[256];
     strncpy(buf, line, sizeof(buf)-1);
     buf[sizeof(buf)-1] = '\0';
@@ -441,7 +760,9 @@ class DucoGateway : public Component, public uart::UARTDevice {
   }
 
   // ── Network data row parser ───────────────────────────────────────────────
-  void parse_network_row(const char *line) {
+  // Publishes the row's stat / %dbt / cntdwn to the given targets (any may be nullptr)
+  void parse_network_row(const char *line, sensor::Sensor *mode_sensor, text_sensor::TextSensor *mode_txt,
+                         sensor::Sensor *pct_sensor, sensor::Sensor *countdown_sensor) {
     char buf[256];
     strncpy(buf, line, sizeof(buf)-1);
     buf[sizeof(buf)-1] = '\0';
@@ -457,15 +778,15 @@ class DucoGateway : public Component, public uart::UARTDevice {
         int mode = vent_mode_from_str(tok);
         ESP_LOGD(TAG, "Network stat=\"%s\" -> %d", tok, mode);
         if (mode >= 0) {
-          if (vent_mode_)     vent_mode_->publish_state((float)mode);
-          if (vent_mode_txt_) vent_mode_txt_->publish_state(vent_mode_to_str(mode));
+          if (mode_sensor) mode_sensor->publish_state((float)mode);
+          if (mode_txt)    mode_txt->publish_state(vent_mode_to_str(mode));
         }
       }
       if (col == col_dbt_ && col_dbt_ != 255) {
         int v = 0;
         if (sscanf(tok, "%d", &v) == 1) {
           ESP_LOGD(TAG, "Network %%dbt=%d", v);
-          if (vent_pct_) vent_pct_->publish_state((float)v);
+          if (pct_sensor) pct_sensor->publish_state((float)v);
         }
       }
       if (col == col_cval_ && col_cval_ != 255) {
@@ -480,7 +801,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
         int v = 0;
         if (sscanf(tok, "%d", &v) == 1) {
           ESP_LOGD(TAG, "Network cntdwn=%d", v);
-          if (countdown_) countdown_->publish_state((float)v);
+          if (countdown_sensor) countdown_sensor->publish_state((float)v);
         }
       }
       col++;
@@ -544,8 +865,12 @@ class DucoGateway : public Component, public uart::UARTDevice {
         break;
 
       case PH_FANSPEED:
-        ESP_LOGD(TAG, "Poll cycle complete");
-        phase_ = PH_IDLE;
+        go_to_info();
+        break;
+
+      case PH_INFO:
+        finish_info_();
+        send_next_info(info_idx_ + 1);
         break;
 
       default:
@@ -576,12 +901,57 @@ class DucoGateway : public Component, public uart::UARTDevice {
   }
 
   void go_to_fanspeed() {
-    if (fan_speed_) {
+    if (fan_speed_ && !fanspeed_unsupported_) {
       send_command("fanspeed\r\n", PH_FANSPEED);
     } else {
-      ESP_LOGI(TAG, "Poll cycle complete");
-      phase_ = PH_IDLE;
+      go_to_info();
     }
+  }
+
+  // Run the info commands when they are due (and on the first cycle after boot).
+  // Compares poll cycle start times, so an info_poll_interval that is a multiple
+  // of poll_interval runs every Nth cycle instead of slipping one cycle.
+  void go_to_info() {
+    if (!info_polled_ || (last_poll_ms_ - last_info_poll_ms_) >= info_poll_interval_ms_) {
+      info_polled_ = true;
+      last_info_poll_ms_ = last_poll_ms_;
+      send_next_info(0);
+      return;
+    }
+    ESP_LOGD(TAG, "Poll cycle complete");
+    phase_ = PH_IDLE;
+  }
+
+  bool info_wanted_(uint8_t idx) const {
+    switch (idx) {
+      case INFO_FAN:         return exhaust_fan_speed_ || supply_fan_speed_;
+      case INFO_TEMPERATURE: return temp_oda_ || temp_sup_ || temp_eta_ || temp_eha_;
+      case INFO_BYPASS:      return bypass_position_ || bypass_target_temp_;
+      case INFO_FAN_CTRL:    return exhaust_pressure_ || supply_pressure_;
+      case INFO_FREEZE:      return frost_state_txt_ || heater_level_;
+      case INFO_STATUS:      return warnings_txt_ || problem_ || filter_warning_;
+      case INFO_FILTER:      return filter_days_ || filter_pct_;
+      case INFO_RTC:         return device_time_txt_ != nullptr;
+      default:               return false;
+    }
+  }
+
+  // Send the first wanted, supported info command at or after idx; end the cycle when none is left.
+  void send_next_info(uint8_t idx) {
+    for (; idx < INFO_COUNT; idx++) {
+      if (!info_wanted_(idx) || (info_unsupported_ & (1u << idx))) continue;
+      info_idx_ = idx;
+      fan_section_ = 0;
+      status_rows_ = 0;
+      status_filter_ = false;
+      status_active_[0] = '\0';
+      char cmd[32];
+      snprintf(cmd, sizeof(cmd), "%s\r\n", INFO_COMMANDS[idx]);
+      send_command(cmd, PH_INFO);
+      return;
+    }
+    ESP_LOGD(TAG, "Poll cycle complete");
+    phase_ = PH_IDLE;
   }
 };
 
