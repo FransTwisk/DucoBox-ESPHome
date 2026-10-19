@@ -20,6 +20,7 @@ CONF_DEVICE_ADDRESS_TEXT = "device_address_text_sensor"
 CONF_LOG_RF_MESSAGES = "log_rf_messages"
 CONF_NETWORK_ID = "network_id"
 CONF_DEVICE_ADDRESS = "device_address"
+CONF_USE_GDO2 = "use_gdo2"
 
 
 def validate_network_id(value):
@@ -40,6 +41,8 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_NETWORK_ID_TEXT):                  cv.use_id(text_sensor.TextSensor),
     cv.Optional(CONF_DEVICE_ADDRESS_TEXT):              cv.use_id(text_sensor.TextSensor),
     cv.Optional(CONF_LOG_RF_MESSAGES, default=False):   cv.boolean,
+    # Board wires CC1101 GDO2 (not GDO0) to the ESP: set IOCFG2 to the packet signal; set cc1101 gdo0_pin to that ESP pin.
+    cv.Optional(CONF_USE_GDO2, default=False):          cv.boolean,
     # Preset pairing (e.g. taken over from ESPEasy). State persisted by a later Pair/Unpair takes precedence.
     cv.Inclusive(CONF_NETWORK_ID, "preset_pairing"):     validate_network_id,
     cv.Inclusive(CONF_DEVICE_ADDRESS, "preset_pairing"): cv.int_range(min=1, max=31),  # 5-bit RF address
@@ -52,6 +55,7 @@ async def to_code(config):
     cc1101_var = await cg.get_variable(config[CONF_CC1101_ID])
     cg.add(var.set_cc1101(cc1101_var))
     cg.add(var.set_log_rf_messages(config[CONF_LOG_RF_MESSAGES]))
+    cg.add(var.set_use_gdo2(config[CONF_USE_GDO2]))
 
     if CONF_NETWORK_ID in config:
         cg.add(var.set_network_id(*bytes.fromhex(config[CONF_NETWORK_ID])))

@@ -28,6 +28,14 @@ namespace duco_rf {
 static const char *const TAG = "duco_rf";
 static const int kFixedTemperature = 210;
 
+// CC1101 SPI access for use_gdo2 (see configure_gdo2_())
+static const uint8_t kCC1101RegIOCFG2 = 0x00;
+static const uint8_t kCC1101ReadSingle = 0x80;
+// GDOx_CFG 0x01: asserts when RX FIFO reaches the threshold or at end of packet,
+// de-asserts when the RX FIFO is empty. Same value the cc1101 component writes to IOCFG0 in packet mode.
+static const uint8_t kGdoCfgRxFifo = 0x01;
+static const uint32_t kGdo2CheckIntervalMs = 60000;
+
 struct PersistedNetworkState {
   uint8_t version;
   uint8_t device_address;
@@ -50,6 +58,7 @@ class DucoRF : public Component, public cc1101::CC1101Listener {
   void set_network_id_text_sensor(text_sensor::TextSensor *s) { network_id_text_sensor_ = s; }
   void set_device_address_text_sensor(text_sensor::TextSensor *s) { device_address_text_sensor_ = s; }
   void set_log_rf_messages(bool log_rf_messages) { log_rf_messages_ = log_rf_messages; }
+  void set_use_gdo2(bool use_gdo2) { use_gdo2_ = use_gdo2; }
 
   void on_packet(const std::vector<uint8_t> &packet, float, float rssi, uint8_t lqi) override {
     this->log_packet("RX", packet, rssi, lqi);
@@ -94,12 +103,25 @@ class DucoRF : public Component, public cc1101::CC1101Listener {
     initial_subscribe_started_at_ = millis();
 
     ESP_LOGI(TAG, "CC1101 transport bound; initial subscribe queued");
+    if (use_gdo2_) {
+      ESP_LOGI(TAG, "use_gdo2: IOCFG2 will be set to 0x%02X once cc1101 setup has finished", kGdoCfgRxFifo);
+    }
     this->sync_network_id_state_();
   }
 
   float get_setup_priority() const override { return setup_priority::HARDWARE; }
 
   void loop() override {
+    // use_gdo2: this component sets up before cc1101 (HARDWARE vs DATA), and
+    // cc1101 setup resets the chip and writes IOCFG2 = 0x0D. So configure GDO2
+    // from loop(), on the first pass after cc1101 has finished setup.
+    if (use_gdo2_ && !gdo2_configured_ && (cc1101_->is_in_loop_state() || cc1101_->is_idle())) {
+      gdo2_configured_ = true;
+      this->configure_gdo2_(true);
+      // Re-check periodically: a cc1101 reset (e.g. the cc1101.reset action) restores IOCFG2 = 0x0D.
+      this->set_interval("gdo2_check", kGdo2CheckIntervalMs, [this]() { this->configure_gdo2_(false); });
+    }
+
     if (initial_subscribe_pending_ && millis() - initial_subscribe_started_at_ >= 250) {
       initial_subscribe_pending_ = false;
       ESP_LOGI(TAG, "Sending initial subscribe to Ducobox");
@@ -174,10 +196,53 @@ class DucoRF : public Component, public cc1101::CC1101Listener {
   uint8_t last_device_address_ {0xFF};
   ESPPreferenceObject network_state_pref_;
   bool log_rf_messages_{false};
+  bool use_gdo2_{false};
+  bool gdo2_configured_{false};
   bool initial_subscribe_pending_{false};
   uint32_t initial_subscribe_started_at_{0};
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+
+  // Raw CC1101 register access for use_gdo2. CC1101Component::write_()/read_()
+  // are protected, but its SPIDevice methods are public. The cc1101 component
+  // keeps its own register mirror (IOCFG2 = 0x0D there); it only writes that
+  // mirror back to the chip from configure(), i.e. on setup and reset.
+  uint8_t read_cc1101_register_(uint8_t reg) {
+    cc1101_->enable();
+    cc1101_->write_byte(kCC1101ReadSingle | reg);
+    uint8_t value = cc1101_->transfer_byte(0x00);
+    cc1101_->disable();
+    return value;
+  }
+
+  void write_cc1101_register_(uint8_t reg, uint8_t value) {
+    cc1101_->enable();
+    cc1101_->write_byte(reg);
+    cc1101_->write_byte(value);
+    cc1101_->disable();
+  }
+
+  /** Route the cc1101 component's packet interrupt signal to GDO2 as well, for
+   *  boards that wire GDO2 (not GDO0) to the ESP. gdo0_pin in YAML must then be
+   *  the ESP pin connected to GDO2. Packet TX never drives that pin. */
+  void configure_gdo2_(bool initial) {
+    uint8_t before = this->read_cc1101_register_(kCC1101RegIOCFG2);
+    if (before == kGdoCfgRxFifo) {
+      if (initial) ESP_LOGI(TAG, "IOCFG2 already 0x%02X", before);
+      return;
+    }
+    if (!initial) ESP_LOGW(TAG, "IOCFG2 changed to 0x%02X (cc1101 reset?); restoring 0x%02X", before, kGdoCfgRxFifo);
+
+    this->write_cc1101_register_(kCC1101RegIOCFG2, kGdoCfgRxFifo);
+    uint8_t after = this->read_cc1101_register_(kCC1101RegIOCFG2);
+    if (after != kGdoCfgRxFifo) {
+      ESP_LOGE(TAG, "IOCFG2 write failed: wrote 0x%02X, read back 0x%02X (was 0x%02X)", kGdoCfgRxFifo, after, before);
+      this->status_set_warning();
+      return;
+    }
+    this->status_clear_warning();
+    ESP_LOGI(TAG, "IOCFG2 (GDO2) set: 0x%02X -> 0x%02X (read back 0x%02X)", before, kGdoCfgRxFifo, after);
+  }
 
   void log_packet(const char *direction, const std::vector<uint8_t> &packet, float rssi, uint8_t lqi) {
     if (packet.size() < 8) {
