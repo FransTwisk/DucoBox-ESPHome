@@ -112,7 +112,7 @@ Newer boxes such as the DucoBox Energy (Premium) report more through their seria
 
 If the box answers `Unknown Cmd` to one of these commands (or to `fanspeed`, which the Energy boxes don't have), it is not sent again until the next reboot, and a warning is logged.
 
-Zone valves (`VLV` nodes in the `Network` table) can report their own mode and percentage. The zone valve of a controller is shown in its `asso` column:
+Zone valves (`VLV` nodes in the `Network` table) report their own mode, percentage and countdown (seconds left of a manual mode set for that zone, e.g. from a room controller). The zone valve of a controller is shown in its `asso` column:
 
 ```yaml
 duco_gateway:
@@ -121,6 +121,7 @@ duco_gateway:
     - node: 67                       # Bedroom zone valve
       ventilation_mode: bedroom_zone_mode          # text sensor, e.g. AUTO / MAN2
       ventilation_percentage: bedroom_zone_percentage
+      countdown: bedroom_zone_countdown            # seconds
 ```
 
 The `Network` reply is about 1.5 KB. Set `rx_buffer_size: 2048` on the `uart` used by `duco_gateway`; with ESPHome's default of 256 bytes the start of a reply can get lost. A `Network` table with a damaged header is skipped instead of being read from the wrong columns.

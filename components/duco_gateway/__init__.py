@@ -45,6 +45,7 @@ CONF_EXT_RH_SENSOR = "ext_humidity_sensor"
 CONF_ZONES = "zones"
 CONF_VENTILATION_MODE = "ventilation_mode"
 CONF_VENTILATION_PERCENTAGE = "ventilation_percentage"
+CONF_COUNTDOWN = "countdown"
 MAX_ZONES = 4  # Keep in sync with MAX_ZONES in duco_gateway.h
 
 # Info commands (polled every info_poll_interval): config key -> (C++ setter, entity class)
@@ -140,8 +141,9 @@ ZONE_SCHEMA = cv.All(
         cv.Required(CONF_NODE): cv.uint8_t,
         cv.Optional(CONF_VENTILATION_MODE): cv.use_id(text_sensor.TextSensor),
         cv.Optional(CONF_VENTILATION_PERCENTAGE): cv.use_id(sensor.Sensor),
+        cv.Optional(CONF_COUNTDOWN): cv.use_id(sensor.Sensor),  # seconds left of a manual mode
     }),
-    cv.has_at_least_one_key(CONF_VENTILATION_MODE, CONF_VENTILATION_PERCENTAGE),
+    cv.has_at_least_one_key(CONF_VENTILATION_MODE, CONF_VENTILATION_PERCENTAGE, CONF_COUNTDOWN),
 )
 
 
@@ -213,13 +215,10 @@ async def to_code(config):
         cg.add(var.add_ext_sensor(entry[CONF_NODE], *sensors))
 
     for entry in config.get(CONF_ZONES, []):
-        mode = await cg.get_variable(entry[CONF_VENTILATION_MODE]) if CONF_VENTILATION_MODE in entry else cg.nullptr
-        pct = (
-            await cg.get_variable(entry[CONF_VENTILATION_PERCENTAGE])
-            if CONF_VENTILATION_PERCENTAGE in entry
-            else cg.nullptr
-        )
-        cg.add(var.add_zone(entry[CONF_NODE], mode, pct))
+        targets = []
+        for key in (CONF_VENTILATION_MODE, CONF_VENTILATION_PERCENTAGE, CONF_COUNTDOWN):
+            targets.append(await cg.get_variable(entry[key]) if key in entry else cg.nullptr)
+        cg.add(var.add_zone(entry[CONF_NODE], *targets))
 
     for key, (method, _) in INFO_SENSORS.items():
         if key in config:

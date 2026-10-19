@@ -72,7 +72,7 @@ struct ExtSensorNode {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Zones (zone valve nodes, e.g. VLV): mode and % from their row in the Network table
+// Zones (zone valve nodes, e.g. VLV): mode, % and countdown from their row in the Network table
 // ─────────────────────────────────────────────────────────────────────────────
 static constexpr uint8_t MAX_ZONES = 4;  // Keep in sync with __init__.py
 
@@ -80,6 +80,7 @@ struct Zone {
   uint8_t                  node       {0};
   text_sensor::TextSensor *mode       {nullptr};
   sensor::Sensor          *percentage {nullptr};
+  sensor::Sensor          *countdown  {nullptr};  // seconds left of a manual mode
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,8 +187,8 @@ class DucoGateway : public Component, public uart::UARTDevice {
   void set_poll_interval_ms(uint32_t ms)                     { poll_interval_ms_ = ms; }
   void set_info_poll_interval_ms(uint32_t ms)                { info_poll_interval_ms_ = ms; }
 
-  // Either mode or percentage may be nullptr.
-  void add_zone(uint8_t node, text_sensor::TextSensor *mode, sensor::Sensor *percentage) {
+  // Any of mode / percentage / countdown may be nullptr.
+  void add_zone(uint8_t node, text_sensor::TextSensor *mode, sensor::Sensor *percentage, sensor::Sensor *countdown) {
     if (zone_count_ >= MAX_ZONES) {
       ESP_LOGE(TAG, "Too many zones (max %u); ignoring node %u", MAX_ZONES, node);
       return;
@@ -196,6 +197,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
     z.node = node;
     z.mode = mode;
     z.percentage = percentage;
+    z.countdown = countdown;
   }
 
   // Info command sensors
@@ -621,7 +623,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
         } else {
           for (uint8_t i = 0; i < zone_count_; i++) {
             if (zones_[i].node == node)
-              parse_network_row(line, nullptr, zones_[i].mode, zones_[i].percentage, nullptr);
+              parse_network_row(line, nullptr, zones_[i].mode, zones_[i].percentage, zones_[i].countdown);
           }
         }
       }
