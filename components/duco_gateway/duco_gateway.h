@@ -41,21 +41,39 @@ static int vent_mode_from_str(const char *s) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// External sensor nodes (read with nodeparaget)
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr uint8_t MAX_EXT_SENSORS = 8;  // Keep in sync with __init__.py
+
+// Parameters read per node, in polling order
+enum ExtParam : uint8_t {
+  EXT_PARAM_CO2,    // nodeparaget <node> 74  → CO2 ppm
+  EXT_PARAM_TEMP,   // nodeparaget <node> 73  → temp /10
+  EXT_PARAM_RH,     // nodeparaget <node> 75  → RH /100
+  EXT_PARAM_COUNT,
+};
+
+static const uint8_t EXT_PARAM_IDS[EXT_PARAM_COUNT] = {74, 73, 75};
+
+struct ExtSensorNode {
+  uint8_t         node {0};
+  sensor::Sensor *sensors[EXT_PARAM_COUNT] {nullptr, nullptr, nullptr};  // Indexed by ExtParam
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Phase state machine
 //
-// IDLE → LOGLEVEL → NETWORK → SENSORINFO → NODEPARA_CO2 → NODEPARA_TEMP →
-//        NODEPARA_RH → FANSPEED → IDLE
+// IDLE → LOGLEVEL → NETWORK → SENSORINFO → NODEPARA (for each ext node:
+//        CO2 → TEMP → RH) → FANSPEED → IDLE
 //
-// Phases that have no sensor configured are skipped automatically.
+// Phases and parameters that have no sensor configured are skipped automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 enum SerialPhase {
   PH_IDLE,
   PH_LOGLEVEL,      // coreloglevel 0x10
   PH_NETWORK,       // Network  → tabel met stat / %dbt / cval / cntdwn
   PH_SENSORINFO,    // sensorinfo → CO2 / RH / TEMP (boxsensor)
-  PH_NODEPARA_CO2,  // nodeparaget <ext_node> 74  → CO2 ppm
-  PH_NODEPARA_TEMP, // nodeparaget <ext_node> 73  → temp /10
-  PH_NODEPARA_RH,   // nodeparaget <ext_node> 75  → RH /100
+  PH_NODEPARA,      // nodeparaget <node> <param> for ext_sensors_[ext_idx_], param ext_param_
   PH_CUSTOM,        // command entered from HA text entity
   PH_FANSPEED,      // fanspeed → RPM
 };
@@ -64,17 +82,24 @@ enum SerialPhase {
 class DucoGateway : public Component, public uart::UARTDevice {
  public:
   // ── Sensor setters ────────────────────────────────────────────────────────
-  void set_ext_sensor_node(uint8_t n)                        { ext_node_ = n; }
-  void set_rh_sensor_node(uint8_t n)                         { rh_node_  = n; }
+  // Any of co2/temp/rh may be nullptr; that parameter is then not polled.
+  void add_ext_sensor(uint8_t node, sensor::Sensor *co2, sensor::Sensor *temp, sensor::Sensor *rh) {
+    if (ext_sensor_count_ >= MAX_EXT_SENSORS) {
+      ESP_LOGE(TAG, "Too many ext_sensors (max %u); ignoring node %u", MAX_EXT_SENSORS, node);
+      return;
+    }
+    ExtSensorNode &e = ext_sensors_[ext_sensor_count_++];
+    e.node = node;
+    e.sensors[EXT_PARAM_CO2]  = co2;
+    e.sensors[EXT_PARAM_TEMP] = temp;
+    e.sensors[EXT_PARAM_RH]   = rh;
+  }
   void set_vent_mode_sensor(sensor::Sensor *s)               { vent_mode_ = s; }
   void set_vent_percentage_sensor(sensor::Sensor *s)         { vent_pct_ = s; }
   void set_fan_speed_sensor(sensor::Sensor *s)               { fan_speed_ = s; }
   void set_countdown_sensor(sensor::Sensor *s)               { countdown_ = s; }
   void set_box_temperature_sensor(sensor::Sensor *s)         { box_temp_ = s; }
   void set_box_humidity_sensor(sensor::Sensor *s)            { box_rh_ = s; }
-  void set_ext_co2_sensor(sensor::Sensor *s)                 { ext_co2_ = s; }
-  void set_ext_temperature_sensor(sensor::Sensor *s)         { ext_temp_ = s; }
-  void set_ext_humidity_sensor(sensor::Sensor *s)            { ext_rh_   = s; }
   void set_vent_mode_text_sensor(text_sensor::TextSensor *s) { vent_mode_txt_ = s; }
   void set_poll_interval_ms(uint32_t ms)                     { poll_interval_ms_ = ms; }
 
@@ -185,8 +210,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
   char     line_buf_[256];
   uint16_t line_pos_ {0};
 
-  uint8_t ext_node_ {3};
-  uint8_t rh_node_  {4};
+  ExtSensorNode ext_sensors_[MAX_EXT_SENSORS];
+  uint8_t       ext_sensor_count_ {0};
+  // nodeparaget cursor: entry in ext_sensors_ and ExtParam currently in flight
+  uint8_t       ext_idx_   {0};
+  uint8_t       ext_param_ {0};
 
   sensor::Sensor          *vent_mode_    {nullptr};
   sensor::Sensor          *vent_pct_     {nullptr};
@@ -194,14 +222,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
   sensor::Sensor          *countdown_    {nullptr};
   sensor::Sensor          *box_temp_     {nullptr};
   sensor::Sensor          *box_rh_       {nullptr};
-  sensor::Sensor          *ext_co2_      {nullptr};
-  sensor::Sensor          *ext_temp_     {nullptr};
-  sensor::Sensor          *ext_rh_       {nullptr};
   text_sensor::TextSensor *vent_mode_txt_{nullptr};
 
   // ── Serial helpers ────────────────────────────────────────────────────────
   bool is_nodeparaget_phase_(SerialPhase p) const {
-    return p == PH_NODEPARA_CO2 || p == PH_NODEPARA_TEMP || p == PH_NODEPARA_RH;
+    return p == PH_NODEPARA;
   }
 
   void flush_rx() {
@@ -336,7 +361,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
         const char *colon = strchr(line, ':');
         if (colon && sscanf(colon+1, " %u", &raw) == 1) {
           ESP_LOGD(TAG, "sensorinfo CO2=%u ppm", raw);
-          // box sensor CO2 — not used separately; ext_co2_ is for external node
+          // box sensor CO2 — not used separately; ext_sensors_ are for external nodes
         }
       } else if (strncmp(line, "  RH", 4) == 0) {
         const char *colon = strchr(line, ':');
@@ -357,20 +382,22 @@ class DucoGateway : public Component, public uart::UARTDevice {
     }
 
     // ── nodeparaget response: "  --> 492" ─────────────────────────────────
-    if (phase_ == PH_NODEPARA_CO2 || phase_ == PH_NODEPARA_TEMP || phase_ == PH_NODEPARA_RH) {
+    if (phase_ == PH_NODEPARA) {
       unsigned int raw = 0;
       if (sscanf(line, "  --> %u", &raw) == 1) {
-        if (phase_ == PH_NODEPARA_CO2) {
-          ESP_LOGD(TAG, "ext CO2=%u ppm", raw);
-          if (ext_co2_) ext_co2_->publish_state((float)raw);
-        } else if (phase_ == PH_NODEPARA_TEMP) {
+        const ExtSensorNode &e = ext_sensors_[ext_idx_];
+        sensor::Sensor *s = e.sensors[ext_param_];
+        if (ext_param_ == EXT_PARAM_CO2) {
+          ESP_LOGD(TAG, "node %u CO2=%u ppm", e.node, raw);
+          if (s) s->publish_state((float)raw);
+        } else if (ext_param_ == EXT_PARAM_TEMP) {
           float temp = (float)raw / 10.0f;
-          ESP_LOGD(TAG, "ext TEMP raw=%u -> %.1f C", raw, temp);
-          if (ext_temp_) ext_temp_->publish_state(temp);
-        } else if (phase_ == PH_NODEPARA_RH) {
+          ESP_LOGD(TAG, "node %u TEMP raw=%u -> %.1f C", e.node, raw, temp);
+          if (s) s->publish_state(temp);
+        } else if (ext_param_ == EXT_PARAM_RH) {
           float rh = (float)raw / 100.0f;
-          ESP_LOGD(TAG, "ext RH raw=%u -> %.2f%%", raw, rh);
-          if (ext_rh_) ext_rh_->publish_state(rh);
+          ESP_LOGD(TAG, "node %u RH raw=%u -> %.2f%%", e.node, raw, rh);
+          if (s) s->publish_state(rh);
         }
       }
       return;
@@ -470,9 +497,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
 
       // If a nodeparaget command timed out, abort the chained parameter reads.
       // Late replies are ambiguous ("--> <value>") and can otherwise be
-      // misattributed to the next phase (e.g. CO2 interpreted as TEMP).
+      // misattributed to the next read (e.g. CO2 interpreted as TEMP, or one
+      // node's value published for the next node).
       if (phase_timed_out_) {
-        ESP_LOGW(TAG, "Aborting nodeparaget chain after timeout in phase %d", (int) phase_);
+        ESP_LOGW(TAG, "Aborting nodeparaget chain after timeout (node %u, param %u)",
+                 ext_sensors_[ext_idx_].node, EXT_PARAM_IDS[ext_param_]);
         phase_timed_out_ = false;
         phase_ = PH_IDLE;
         last_poll_ms_ = millis();
@@ -506,28 +535,8 @@ class DucoGateway : public Component, public uart::UARTDevice {
         go_to_ext_sensor();
         break;
 
-      case PH_NODEPARA_CO2:
-        if (ext_temp_) {
-          char cmd[32];
-          snprintf(cmd, sizeof(cmd), "nodeparaget %u 73\r\n", ext_node_);
-          send_command(cmd, PH_NODEPARA_TEMP);
-        } else {
-          go_to_fanspeed();
-        }
-        break;
-
-      case PH_NODEPARA_TEMP:
-        if (ext_rh_) {
-          char cmd[32];
-          snprintf(cmd, sizeof(cmd), "nodeparaget %u 75\r\n", rh_node_);
-          send_command(cmd, PH_NODEPARA_RH);
-        } else {
-          go_to_fanspeed();
-        }
-        break;
-
-      case PH_NODEPARA_RH:
-        go_to_fanspeed();
+      case PH_NODEPARA:
+        send_next_nodepara(ext_idx_, ext_param_ + 1);
         break;
 
       case PH_CUSTOM:
@@ -546,21 +555,24 @@ class DucoGateway : public Component, public uart::UARTDevice {
   }
 
   void go_to_ext_sensor() {
-    if (ext_co2_) {
-      char cmd[32];
-      snprintf(cmd, sizeof(cmd), "nodeparaget %u 74\r\n", ext_node_);
-      send_command(cmd, PH_NODEPARA_CO2);
-    } else if (ext_temp_) {
-      char cmd[32];
-      snprintf(cmd, sizeof(cmd), "nodeparaget %u 73\r\n", ext_node_);
-      send_command(cmd, PH_NODEPARA_TEMP);
-    } else if (ext_rh_) {
-      char cmd[32];
-      snprintf(cmd, sizeof(cmd), "nodeparaget %u 75\r\n", rh_node_);
-      send_command(cmd, PH_NODEPARA_RH);
-    } else {
-      go_to_fanspeed();
+    send_next_nodepara(0, 0);
+  }
+
+  // Send the first configured nodeparaget at or after cursor (idx, param),
+  // or move on to fanspeed when no external reads are left in this cycle.
+  void send_next_nodepara(uint8_t idx, uint8_t param) {
+    for (; idx < ext_sensor_count_; idx++, param = 0) {
+      for (; param < EXT_PARAM_COUNT; param++) {
+        if (ext_sensors_[idx].sensors[param] == nullptr) continue;
+        ext_idx_   = idx;
+        ext_param_ = param;
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "nodeparaget %u %u\r\n", ext_sensors_[idx].node, EXT_PARAM_IDS[param]);
+        send_command(cmd, PH_NODEPARA);
+        return;
+      }
     }
+    go_to_fanspeed();
   }
 
   void go_to_fanspeed() {
