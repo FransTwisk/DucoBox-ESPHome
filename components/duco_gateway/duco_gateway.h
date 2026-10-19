@@ -5,6 +5,12 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/number/number.h"
+#include "esphome/components/select/select.h"
+#include "esphome/core/helpers.h"
+#ifdef USE_TIME
+#include "esphome/components/time/real_time_clock.h"
+#endif
 
 #include <cmath>
 #include <cstdlib>
@@ -99,11 +105,46 @@ static const char *const INFO_COMMANDS[INFO_COUNT] = {
     "FreezeProtectInfo", "StatusMonitorInfo", "FilterInfo", "RtcGetTime"};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Settings (number / select platforms). Written with the *Set commands through a
+// small queue; read back with the *Get commands after each write and every
+// settings_poll_interval, so the entities always show what the box reports.
+// ─────────────────────────────────────────────────────────────────────────────
+enum SettingSource : uint8_t {
+  SETTING_NODE_CONFIG,  // NodeConfigGet <node> / NodeConfigSet <node> <param> <value>
+  SETTING_GENERAL,      // SettingsParaGet / SettingsParaSet <param> <value>
+};
+
+struct SettingNumber {
+  number::Number *number {nullptr};
+  uint8_t         source {SETTING_NODE_CONFIG};
+  uint8_t         node   {0};
+  uint8_t         param  {0};
+  float           scale  {1.0f};  // entity value = box value * scale
+};
+
+// Read-back groups, one bit each in settings_pending_
+static constexpr uint8_t GROUP_BYPASS     = 0;     // BypassParaGet
+static constexpr uint8_t GROUP_GENERAL    = 1;     // SettingsParaGet
+static constexpr uint8_t GROUP_NODE_FIRST = 2;     // NodeConfigGet setting_nodes_[bit - GROUP_NODE_FIRST]
+static constexpr uint8_t GROUP_NONE       = 0xFF;
+
+static constexpr uint8_t MAX_SETTING_NUMBERS = 24;  // Keep in sync with number.py
+static constexpr uint8_t MAX_SETTING_NODES   = 6;   // Distinct nodes with NodeConfig numbers (bits 2..7)
+static constexpr uint8_t SET_QUEUE_SIZE      = 6;
+
+struct QueuedSet {
+  char    cmd[40] {0};
+  uint8_t group   {GROUP_NONE};  // read back after writing
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Phase state machine
 //
 // IDLE → LOGLEVEL → NETWORK → SENSORINFO → NODEPARA (for each ext node:
-//        CO2 → TEMP → RH) → FANSPEED → INFO (each info command, when due) → IDLE
+//        CO2 → TEMP → RH) → FANSPEED → INFO (each info command, when due)
+//        → SETTING (each settings Get, when due) → IDLE
 //
+// Queued settings writes (SET) and their read-back run between poll cycles.
 // Phases, parameters and info commands that have no sensor configured are skipped automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 enum SerialPhase {
@@ -115,6 +156,8 @@ enum SerialPhase {
   PH_CUSTOM,        // command entered from HA text entity
   PH_FANSPEED,      // fanspeed → RPM
   PH_INFO,          // INFO_COMMANDS[info_idx_]
+  PH_SET,           // queued *Set command
+  PH_SETTING,       // settings Get for read-back group setting_group_
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +218,58 @@ class DucoGateway : public Component, public uart::UARTDevice {
   void set_filter_remaining_percent_sensor(sensor::Sensor *s)        { filter_pct_ = s; }
   void set_device_time_text_sensor(text_sensor::TextSensor *s)       { device_time_txt_ = s; }
 
+  // ── Settings ──────────────────────────────────────────────────────────────
+  void set_settings_poll_interval_ms(uint32_t ms)                    { settings_poll_interval_ms_ = ms; }
+  void set_bypass_mode_select(select::Select *s)                     { bypass_select_ = s; }
+#ifdef USE_TIME
+  void set_time(time::RealTimeClock *t)                              { time_ = t; }
+#endif
+
+  void add_setting_number(number::Number *n, uint8_t source, uint8_t node, uint8_t param, float scale) {
+    if (setting_count_ >= MAX_SETTING_NUMBERS) {
+      ESP_LOGE(TAG, "Too many duco_gateway numbers (max %u)", MAX_SETTING_NUMBERS);
+      return;
+    }
+    if (source == SETTING_NODE_CONFIG && node_group_(node) == GROUP_NONE) {
+      if (setting_node_count_ >= MAX_SETTING_NODES) {
+        ESP_LOGE(TAG, "Numbers for too many nodes (max %u); ignoring node %u", MAX_SETTING_NODES, node);
+        return;
+      }
+      setting_nodes_[setting_node_count_++] = node;
+    }
+    SettingNumber &s = settings_[setting_count_++];
+    s.number = n;
+    s.source = source;
+    s.node = node;
+    s.param = param;
+    s.scale = scale;
+  }
+
+  // Called by DucoNumber / DucoSelect when changed from HA
+  void write_setting_number(const number::Number *n, float value) {
+    for (uint8_t i = 0; i < setting_count_; i++) {
+      const SettingNumber &s = settings_[i];
+      if (s.number != n) continue;
+      long raw = lroundf(value / s.scale);
+      char cmd[40];
+      if (s.source == SETTING_NODE_CONFIG) {
+        snprintf(cmd, sizeof(cmd), "NodeConfigSet %u %u %ld", s.node, s.param, raw);
+        queue_set_(cmd, node_group_(s.node));
+      } else {
+        snprintf(cmd, sizeof(cmd), "SettingsParaSet %u %ld", s.param, raw);
+        queue_set_(cmd, GROUP_GENERAL);
+      }
+      return;
+    }
+  }
+
+  void write_bypass_mode(size_t index) {
+    if (index > 2) return;
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "BypassParaSet 0 %u", (unsigned) index);
+    queue_set_(cmd, GROUP_BYPASS);
+  }
+
   // Request an immediate network dump with all discovered nodes in logs.
   void log_all_nodes() {
     log_all_nodes_requested_ = true;
@@ -230,11 +325,29 @@ class DucoGateway : public Component, public uart::UARTDevice {
     rx_pump();
 
     if (phase_ == PH_IDLE) {
+      // After a write the box sometimes ignores the next command; give it a moment.
+      if (settling_) {
+        if ((millis() - settle_start_ms_) < SET_SETTLE_MS) return;
+        settling_ = false;
+      }
+
       if (custom_command_requested_) {
         custom_command_requested_ = false;
         char cmd[136];
         snprintf(cmd, sizeof(cmd), "%s\r\n", custom_command_);
         send_command(cmd, PH_CUSTOM);
+        return;
+      }
+
+#ifdef USE_TIME
+      check_clock_sync_();
+#endif
+      if (set_count_ > 0) {
+        send_next_set_();
+        return;
+      }
+      if (settings_pending_ != 0) {  // read-back after a write
+        send_next_setting_get();
         return;
       }
 
@@ -257,6 +370,8 @@ class DucoGateway : public Component, public uart::UARTDevice {
   static constexpr const char *TAG               = "duco_serial";
   static constexpr uint32_t    CMD_TIMEOUT_MS    = 8000;   // Should be enough even for slow responses, but short enough to recover from errors. Ducobox is usually very fast (responds in <100ms) but can be slow when the network table grows large or communication is bad with one of the nodes. Duco fails the command after roughly 5 seconds, but we set a slightly longer timeout here to also cover the case where we miss the "Failed" response.
   static constexpr uint32_t    INFO_QUIET_MS     = 300;    // Info reply complete after this long without data (the box prints a whole reply in well under 100 ms)
+  static constexpr uint32_t    SET_SETTLE_MS     = 1500;   // Pause after a *Set before the next command (box sometimes ignores one sent right away)
+  static constexpr const char *CLOCK_SYNC_CMD    = "@clock";  // Queue marker; RtcSetTime is formatted when sent
 
   SerialPhase phase_        {PH_IDLE};
   uint32_t    cmd_sent_ms_  {0};
@@ -286,6 +401,30 @@ class DucoGateway : public Component, public uart::UARTDevice {
   uint8_t     status_rows_       {0};    // StatusMonitorInfo: item rows seen
   bool        status_filter_     {false};
   char        status_active_[128] {0};   // StatusMonitorInfo: "item (level), ..."
+
+  // Settings
+  SettingNumber   settings_[MAX_SETTING_NUMBERS];
+  uint8_t         setting_count_       {0};
+  uint8_t         setting_nodes_[MAX_SETTING_NODES] {0};
+  uint8_t         setting_node_count_  {0};
+  select::Select *bypass_select_       {nullptr};
+  uint32_t        settings_poll_interval_ms_{3600000};
+  uint32_t        last_settings_poll_ms_ {0};
+  bool            settings_polled_     {false};
+  uint8_t         settings_pending_    {0};           // Read-back groups still to send
+  uint8_t         setting_group_       {GROUP_NONE};  // Group of the Get in flight
+  QueuedSet       set_queue_[SET_QUEUE_SIZE];
+  uint8_t         set_head_            {0};
+  uint8_t         set_count_           {0};
+  uint8_t         set_group_           {GROUP_NONE};  // Read-back group of the Set in flight
+  bool            settling_            {false};
+  uint32_t        settle_start_ms_     {0};
+#ifdef USE_TIME
+  time::RealTimeClock *time_           {nullptr};
+  bool            clock_synced_        {false};
+  uint16_t        clock_sync_yday_     {0};
+  uint32_t        last_clock_check_ms_ {0};
+#endif
 
   // Network table column indices (resolved from header row)
   uint8_t col_stat_   {255};
@@ -401,9 +540,10 @@ class DucoGateway : public Component, public uart::UARTDevice {
       }
     }
 
-    // Info replies mostly have no "Done": complete once more than the echo has
-    // arrived and the box has been quiet for a moment.
-    if (!got_done_ && phase_ == PH_INFO && reply_lines_ >= 2 && (millis() - last_rx_ms_) >= INFO_QUIET_MS)
+    // Info and settings replies often have no "Done": complete once more than the
+    // echo has arrived and the box has been quiet for a moment.
+    if (!got_done_ && (phase_ == PH_INFO || phase_ == PH_SETTING) && reply_lines_ >= 2 &&
+        (millis() - last_rx_ms_) >= INFO_QUIET_MS)
       got_done_ = true;
 
     if (got_done_) advance_phase();
@@ -442,7 +582,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
     }
     if (strstr(line, "Done") != nullptr) { got_done_ = true; return; }
     if (strstr(line, "Failed") != nullptr) {
-      ESP_LOGW(TAG, "Command failed in phase %d", (int) phase_);
+      if (phase_ == PH_SET) {
+        ESP_LOGW(TAG, "Box rejected the setting (value is read back to show the current one)");
+      } else {
+        ESP_LOGW(TAG, "Command failed in phase %d", (int) phase_);
+      }
       got_done_ = true;
       return;
     }
@@ -548,6 +692,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
 
     if (phase_ == PH_INFO) {
       parse_info_line_(line);
+      return;
+    }
+
+    if (phase_ == PH_SETTING) {
+      parse_setting_line_(line);
       return;
     }
   }
@@ -876,6 +1025,17 @@ class DucoGateway : public Component, public uart::UARTDevice {
         send_next_info(info_idx_ + 1);
         break;
 
+      case PH_SET:
+        settling_ = true;
+        settle_start_ms_ = millis();
+        if (set_group_ != GROUP_NONE) settings_pending_ |= (1u << set_group_);
+        phase_ = PH_IDLE;
+        break;
+
+      case PH_SETTING:
+        send_next_setting_get();
+        break;
+
       default:
         phase_ = PH_IDLE;
         break;
@@ -921,8 +1081,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
       send_next_info(0);
       return;
     }
-    ESP_LOGD(TAG, "Poll cycle complete");
-    phase_ = PH_IDLE;
+    go_to_settings();
   }
 
   bool info_wanted_(uint8_t idx) const {
@@ -953,9 +1112,160 @@ class DucoGateway : public Component, public uart::UARTDevice {
       send_command(cmd, PH_INFO);
       return;
     }
+    go_to_settings();
+  }
+
+  // ── Settings: read-back ───────────────────────────────────────────────────
+  uint8_t node_group_(uint8_t node) const {
+    for (uint8_t i = 0; i < setting_node_count_; i++)
+      if (setting_nodes_[i] == node) return GROUP_NODE_FIRST + i;
+    return GROUP_NONE;
+  }
+
+  uint8_t all_setting_groups_() const {
+    uint8_t mask = 0;
+    if (bypass_select_) mask |= 1u << GROUP_BYPASS;
+    for (uint8_t i = 0; i < setting_count_; i++)
+      if (settings_[i].source == SETTING_GENERAL) mask |= 1u << GROUP_GENERAL;
+    for (uint8_t i = 0; i < setting_node_count_; i++) mask |= 1u << (GROUP_NODE_FIRST + i);
+    return mask;
+  }
+
+  // End of the poll cycle: read all settings when due (and on the first cycle after boot)
+  void go_to_settings() {
+    uint8_t all = all_setting_groups_();
+    if (all != 0 && (!settings_polled_ || (last_poll_ms_ - last_settings_poll_ms_) >= settings_poll_interval_ms_)) {
+      settings_polled_ = true;
+      last_settings_poll_ms_ = last_poll_ms_;
+      settings_pending_ |= all;
+    }
+    send_next_setting_get();
+  }
+
+  // Send the Get for the lowest pending read-back group; end the cycle when none is left.
+  void send_next_setting_get() {
+    for (uint8_t g = 0; g < 8; g++) {
+      if (!(settings_pending_ & (1u << g))) continue;
+      settings_pending_ &= ~(1u << g);
+      setting_group_ = g;
+      char cmd[32];
+      if (g == GROUP_BYPASS) {
+        snprintf(cmd, sizeof(cmd), "BypassParaGet\r\n");
+      } else if (g == GROUP_GENERAL) {
+        snprintf(cmd, sizeof(cmd), "SettingsParaGet\r\n");
+      } else {
+        snprintf(cmd, sizeof(cmd), "NodeConfigGet %u\r\n", setting_nodes_[g - GROUP_NODE_FIRST]);
+      }
+      send_command(cmd, PH_SETTING);
+      return;
+    }
     ESP_LOGD(TAG, "Poll cycle complete");
     phase_ = PH_IDLE;
   }
+
+  // "4. CO2 Setpoint   :  800 ppm  [0:10:2000]" (NodeConfigGet)
+  // "5. COMFORT TEMP Z1    : 205"               (SettingsParaGet)
+  // "0. BYPASS MODE            : AUTO (0) [0-2]" (BypassParaGet)
+  void parse_setting_line_(const char *line) {
+    const char *s = skip_spaces_(line);
+    const char *colon = strchr(s, ':');
+    int param = 0, value = 0;
+    if (colon == nullptr || sscanf(s, "%d.", &param) != 1) return;
+
+    if (setting_group_ == GROUP_BYPASS) {
+      const char *paren = strchr(colon, '(');
+      if (param == 0 && paren != nullptr && sscanf(paren + 1, "%d", &value) == 1 && bypass_select_ != nullptr &&
+          value >= 0 && (size_t) value < bypass_select_->size()) {
+        ESP_LOGD(TAG, "Bypass mode=%d", value);
+        bypass_select_->publish_state((size_t) value);
+      }
+      return;
+    }
+
+    if (sscanf(colon + 1, "%d", &value) != 1) return;
+    uint8_t source = setting_group_ == GROUP_GENERAL ? SETTING_GENERAL : SETTING_NODE_CONFIG;
+    uint8_t node = source == SETTING_NODE_CONFIG ? setting_nodes_[setting_group_ - GROUP_NODE_FIRST] : 0;
+    for (uint8_t i = 0; i < setting_count_; i++) {
+      const SettingNumber &n = settings_[i];
+      if (n.source != source || n.node != node || n.param != param) continue;
+      ESP_LOGD(TAG, "Setting node %u param %u = %d", node, param, value);
+      n.number->publish_state(value * n.scale);
+    }
+  }
+
+  // ── Settings: writes ──────────────────────────────────────────────────────
+  // Queue a *Set command. A pending write for the same setting (same text up to
+  // the last space, e.g. "NodeConfigSet 3 4 ") is replaced instead of queued again.
+  void queue_set_(const char *cmd, uint8_t group) {
+    const char *last_space = strrchr(cmd, ' ');
+    size_t key_len = last_space != nullptr ? (size_t) (last_space - cmd + 1) : strlen(cmd);
+    for (uint8_t i = 0; i < set_count_; i++) {
+      QueuedSet &q = set_queue_[(set_head_ + i) % SET_QUEUE_SIZE];
+      if (strncmp(q.cmd, cmd, key_len) == 0) {
+        snprintf(q.cmd, sizeof(q.cmd), "%s", cmd);
+        return;
+      }
+    }
+    if (set_count_ >= SET_QUEUE_SIZE) {
+      ESP_LOGW(TAG, "Settings queue full; dropping \"%s\"", cmd);
+      return;
+    }
+    QueuedSet &q = set_queue_[(set_head_ + set_count_) % SET_QUEUE_SIZE];
+    snprintf(q.cmd, sizeof(q.cmd), "%s", cmd);
+    q.group = group;
+    set_count_++;
+  }
+
+  void send_next_set_() {
+    QueuedSet &q = set_queue_[set_head_];
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "%s", q.cmd);
+#ifdef USE_TIME
+    if (strcmp(q.cmd, CLOCK_SYNC_CMD) == 0) {
+      // Formatted now, so time spent waiting in the queue doesn't make the box clock late
+      ESPTime now = time_->now();
+      snprintf(cmd, sizeof(cmd), "RtcSetTime %u %u %u %u %u %u", now.day_of_month, now.month, now.year, now.hour,
+               now.minute, now.second);
+    }
+#endif
+    set_group_ = q.group;
+    set_head_ = (set_head_ + 1) % SET_QUEUE_SIZE;
+    set_count_--;
+
+    ESP_LOGI(TAG, "Writing setting: %s", cmd);
+    char line[52];
+    snprintf(line, sizeof(line), "%s\r\n", cmd);
+    send_command(line, PH_SET);
+  }
+
+#ifdef USE_TIME
+  // Set the box clock once the time source is valid after boot, then daily from
+  // 04:00 local time (so a DST change is followed within a day).
+  void check_clock_sync_() {
+    if (time_ == nullptr || (millis() - last_clock_check_ms_) < 1000) return;
+    last_clock_check_ms_ = millis();
+    ESPTime now = time_->now();
+    if (!now.is_valid()) return;
+    if (clock_synced_ && (now.day_of_year == clock_sync_yday_ || now.hour < 4)) return;
+    clock_synced_ = true;
+    clock_sync_yday_ = now.day_of_year;
+    queue_set_(CLOCK_SYNC_CMD, GROUP_NONE);
+  }
+#endif
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Number / select entities (platforms number.py / select.py). Changes are queued
+// on the gateway; the state is only published from the value read back.
+// ─────────────────────────────────────────────────────────────────────────────
+class DucoNumber : public number::Number, public Parented<DucoGateway> {
+ protected:
+  void control(float value) override { this->parent_->write_setting_number(this, value); }
+};
+
+class DucoSelect : public select::Select, public Parented<DucoGateway> {
+ protected:
+  void control(size_t index) override { this->parent_->write_bypass_mode(index); }
 };
 
 }  // namespace duco_gateway

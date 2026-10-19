@@ -1,16 +1,21 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import uart, sensor, text_sensor, binary_sensor
-from esphome.const import CONF_CO2, CONF_HUMIDITY, CONF_ID, CONF_TEMPERATURE
+from esphome.components import time as time_
+from esphome.const import CONF_CO2, CONF_HUMIDITY, CONF_ID, CONF_TEMPERATURE, CONF_TIME_ID
 
 DEPENDENCIES = ["uart"]
-AUTO_LOAD = ["sensor", "text_sensor", "binary_sensor"]
+AUTO_LOAD = ["sensor", "text_sensor", "binary_sensor", "number", "select"]
 
 duco_gateway_ns = cg.esphome_ns.namespace("duco_gateway")
 DucoGateway = duco_gateway_ns.class_("DucoGateway", cg.Component, uart.UARTDevice)
 
 CONF_POLL_INTERVAL = "poll_interval"
 CONF_INFO_POLL_INTERVAL = "info_poll_interval"
+CONF_SETTINGS_POLL_INTERVAL = "settings_poll_interval"
+
+# Used by the number / select platforms to refer to this component
+CONF_DUCO_GATEWAY_ID = "duco_gateway_id"
 
 # External sensor nodes (nodeparaget)
 CONF_EXT_SENSORS = "ext_sensors"
@@ -146,6 +151,10 @@ CONFIG_SCHEMA = cv.All(
         # Core behavior
         cv.Optional(CONF_POLL_INTERVAL, default="15s"): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_INFO_POLL_INTERVAL, default="60s"): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_SETTINGS_POLL_INTERVAL, default="1h"): cv.positive_time_period_milliseconds,
+
+        # Time source to keep the box clock right (synced after boot and daily from 04:00)
+        cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
 
         # External sensor nodes (CO2 / temperature / humidity per node)
         cv.Optional(CONF_EXT_SENSORS): cv.All(
@@ -192,6 +201,10 @@ async def to_code(config):
 
     cg.add(var.set_poll_interval_ms(config[CONF_POLL_INTERVAL].total_milliseconds))
     cg.add(var.set_info_poll_interval_ms(config[CONF_INFO_POLL_INTERVAL].total_milliseconds))
+    cg.add(var.set_settings_poll_interval_ms(config[CONF_SETTINGS_POLL_INTERVAL].total_milliseconds))
+
+    if CONF_TIME_ID in config:
+        cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))
 
     for entry in config.get(CONF_EXT_SENSORS, []):
         sensors = []
