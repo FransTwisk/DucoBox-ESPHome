@@ -162,11 +162,29 @@ number:
 | Platform / `type` | Target | Box command | Range |
 |---|---|---|---|
 | select `bypass_mode` | – | `BypassParaSet 0 <n>` | `Auto`, `Closed (heat recovery)`, `Open (bypass)` |
+| select `zone_ventilation` | `node` (zone valve) | `NodeSetOverrule <node> <%>` | `Auto`, `Min`, `Med`, `Max`: see below |
 | number `co2_setpoint` | `node` | `NodeConfigSet <node> 4` | 400–2000 ppm |
 | number `comfort_temperature` | `zone` (1 or 2) | `SettingsParaSet 5/6` | 15–30 °C |
 | number `manual_1`, `manual_2`, `manual_3` | `node` | `NodeConfigSet <node> 7/8/9` | % for speed 1 (0–50), 2 (15–100), 3 (50–100) |
 | number `manual_timeout` | `node` | `NodeConfigSet <node> 10` | 5–9995 min: how long a manual speed lasts |
 | number `auto_min`, `auto_max` | `node` | `NodeConfigSet <node> 1/2` | 10–100 %: range in automatic mode |
+
+### Ventilation per zone
+The ESP is paired as a remote for the whole box, so its RF commands (and the fan / select in your configuration that send them) set the ventilation of the box: every zone runs at the box's level, while each zone's own mode stays `AUTO`. A wall controller in a room sets only its own zone (`MAN1`–`MAN3` in that zone's row of the `Network` table); the box then runs at the average of the zones.
+
+To set a single zone from Home Assistant, add a `zone_ventilation` select per zone valve:
+
+```yaml
+select:
+  - platform: duco_gateway
+    type: zone_ventilation
+    node: 67                    # zone valve (VLV) of the bedroom
+    name: "Bedroom Ventilation"
+```
+
+`Min`, `Med` and `Max` override the zone with its own speed 1/2/3 level (read from the zone with `NodeConfigGet`, e.g. 10/50/100 %), using `NodeSetOverrule <node> <%>`. The box itself has no time limit on such an override, so the gateway ends it like a wall controller does: after the zone's manual timeout (`NodeConfigGet` param 10, e.g. 15 min), it sends `NodeSetOverrule <node> 255` (no override). The zone's `countdown` sensor shows the time left, and choosing the same level again restarts it. `Auto` ends the override right away. If the gateway finds an override it didn't set (for example one left from before the ESP restarted), it ends that one after the manual timeout too. While an override is active, the zone's mode shows `EXTN` (the box shows that in the row's info column; its `stat` stays `AUTO`), and the select shows the nearest level. The select also shows `Min`/`Med`/`Max` while a wall controller has set that zone.
+
+`Auto` only ends an override set with `NodeSetOverrule`; it doesn't cancel a speed chosen on a wall controller.
 
 `Closed (heat recovery)` keeps the bypass closed so all air passes the heat exchanger; `Open (bypass)` opens it fully. In `Auto` the box moves the bypass gradually (about 5 % every 2 minutes), so it can take a while to settle after switching back.
 
