@@ -7,6 +7,7 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <strings.h>
 
 namespace esphome {
@@ -609,8 +610,10 @@ class DucoGateway : public Component, public uart::UARTDevice {
           const char *code = s + 9;
           sensor::Sensor *t = starts_with_(code, "ODA") ? temp_oda_ : starts_with_(code, "SUP") ? temp_sup_
                             : starts_with_(code, "ETA") ? temp_eta_ : starts_with_(code, "EHA") ? temp_eha_ : nullptr;
-          float temp = 0;
-          if (sscanf(colon + 1, "%f", &temp) == 1) {
+          // strtof, not sscanf("%f"): ESPHome builds for ESP8266 without scanf float support
+          char *end = nullptr;
+          float temp = strtof(colon + 1, &end);
+          if (end != colon + 1) {
             bool ok = strstr(colon, "(OK)") != nullptr;
             ESP_LOGD(TAG, "TemperatureInfo %.3s=%.1f C%s", code, temp, ok ? "" : " (sensor not OK)");
             if (t) t->publish_state(ok ? temp : NAN);
