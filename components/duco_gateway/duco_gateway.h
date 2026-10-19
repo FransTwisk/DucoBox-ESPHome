@@ -12,6 +12,7 @@
 #include "esphome/components/time/real_time_clock.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <strings.h>
@@ -81,6 +82,23 @@ struct Zone {
   text_sensor::TextSensor *mode       {nullptr};
   sensor::Sensor          *percentage {nullptr};
   sensor::Sensor          *countdown  {nullptr};  // seconds left of a manual mode
+  select::Select          *control    {nullptr};  // Auto / Min / Med / Max (NodeSetOverrule)
+  uint8_t                  levels[3]  {0, 0, 0};  // Manual 1/2/3 % (NodeConfig 7/8/9), 0 = not read yet
+  uint16_t                 manual_timeout_min {0};  // NodeConfig 10, 0 = not read yet
+  uint32_t                 override_start_ms  {0};
+  uint32_t                 override_ms        {0};  // Override set from here runs this long; 0 = none
+  bool                     write_pending      {false};  // NodeSetOverrule queued, not yet sent
+};
+
+static constexpr uint8_t ZONE_OVERRIDE_NONE = 255;              // NodeSetOverrule value / ovrl column: no override
+static const uint8_t     ZONE_DEFAULT_LEVELS[3] = {10, 50, 100};  // Until the zone's own levels have been read
+
+// One row of the Network table; -1 = column missing or not a number
+struct NetworkRow {
+  int mode      {-1};  // vent_mode_from_str() of stat
+  int pct       {-1};  // %dbt
+  int countdown {-1};  // cntdwn (seconds)
+  int ovrl      {-1};  // overrule (255 = none)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,6 +146,7 @@ static constexpr uint8_t GROUP_BYPASS     = 0;     // BypassParaGet
 static constexpr uint8_t GROUP_GENERAL    = 1;     // SettingsParaGet
 static constexpr uint8_t GROUP_NODE_FIRST = 2;     // NodeConfigGet setting_nodes_[bit - GROUP_NODE_FIRST]
 static constexpr uint8_t GROUP_NONE       = 0xFF;
+static constexpr uint8_t GROUP_POLL       = 0xFE;  // After the write, poll the Network table right away
 
 static constexpr uint8_t MAX_SETTING_NUMBERS = 24;  // Keep in sync with number.py
 static constexpr uint8_t MAX_SETTING_NODES   = 6;   // Distinct nodes with NodeConfig numbers (bits 2..7)
@@ -189,15 +208,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
 
   // Any of mode / percentage / countdown may be nullptr.
   void add_zone(uint8_t node, text_sensor::TextSensor *mode, sensor::Sensor *percentage, sensor::Sensor *countdown) {
-    if (zone_count_ >= MAX_ZONES) {
-      ESP_LOGE(TAG, "Too many zones (max %u); ignoring node %u", MAX_ZONES, node);
-      return;
-    }
-    Zone &z = zones_[zone_count_++];
-    z.node = node;
-    z.mode = mode;
-    z.percentage = percentage;
-    z.countdown = countdown;
+    Zone *z = find_or_add_zone_(node);
+    if (z == nullptr) return;
+    z->mode = mode;
+    z->percentage = percentage;
+    z->countdown = countdown;
   }
 
   // Info command sensors
@@ -272,6 +287,36 @@ class DucoGateway : public Component, public uart::UARTDevice {
     queue_set_(cmd, GROUP_BYPASS);
   }
 
+  // Zone ventilation select (zone_ventilation): Auto / Min / Med / Max for one zone valve.
+  // Min/Med/Max override the zone with its own speed 1/2/3 level and, like a wall
+  // controller, end after the zone's manual timeout.
+  void add_zone_control(uint8_t node, select::Select *s) {
+    Zone *z = find_or_add_zone_(node);
+    if (z == nullptr) return;
+    z->control = s;
+    // The zone's levels and manual timeout come from NodeConfigGet <node>
+    if (node_group_(node) == GROUP_NONE) {
+      if (setting_node_count_ >= MAX_SETTING_NODES) {
+        ESP_LOGE(TAG, "Settings for too many nodes (max %u); zone %u uses default levels", MAX_SETTING_NODES, node);
+        return;
+      }
+      setting_nodes_[setting_node_count_++] = node;
+    }
+  }
+
+  void write_zone_control(uint8_t node, size_t index) {
+    Zone *z = find_zone_(node);
+    if (z == nullptr || index > 3) return;
+    if (index == 0) {
+      z->override_ms = 0;
+      queue_zone_override_(node, ZONE_OVERRIDE_NONE);
+      return;
+    }
+    uint8_t level = z->levels[index - 1] != 0 ? z->levels[index - 1] : ZONE_DEFAULT_LEVELS[index - 1];
+    start_zone_override_timer_(*z);
+    queue_zone_override_(node, level);
+  }
+
   // Request an immediate network dump with all discovered nodes in logs.
   void log_all_nodes() {
     log_all_nodes_requested_ = true;
@@ -344,6 +389,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
 #ifdef USE_TIME
       check_clock_sync_();
 #endif
+      check_zone_overrides_();
       if (set_count_ > 0) {
         send_next_set_();
         return;
@@ -419,6 +465,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
   uint8_t         set_head_            {0};
   uint8_t         set_count_           {0};
   uint8_t         set_group_           {GROUP_NONE};  // Read-back group of the Set in flight
+  char            set_cmd_[48]         {0};           // The Set in flight
   bool            settling_            {false};
   uint32_t        settle_start_ms_     {0};
 #ifdef USE_TIME
@@ -433,6 +480,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
   uint8_t col_dbt_    {255};
   uint8_t col_cval_   {255};
   uint8_t col_cntdwn_ {255};
+  uint8_t col_ovrl_   {255};
 
   char     line_buf_[256];
   uint16_t line_pos_ {0};
@@ -617,14 +665,17 @@ class DucoGateway : public Component, public uart::UARTDevice {
         if (log_all_nodes_active_) {
           ESP_LOGI(TAG, "Node %d: %s", node, line);
         }
-        // Node 1 (the box) updates the box-level sensors, zone nodes their zone sensors
+        // Node 1 (the box) updates the box-level sensors, zone nodes their zone entities
         if (node == 1) {
-          parse_network_row(line, vent_mode_, vent_mode_txt_, vent_pct_, countdown_);
-        } else {
-          for (uint8_t i = 0; i < zone_count_; i++) {
-            if (zones_[i].node == node)
-              parse_network_row(line, nullptr, zones_[i].mode, zones_[i].percentage, zones_[i].countdown);
+          NetworkRow row = parse_network_row(line);
+          if (row.mode >= 0) {
+            if (vent_mode_)     vent_mode_->publish_state((float) row.mode);
+            if (vent_mode_txt_) vent_mode_txt_->publish_state(vent_mode_to_str(row.mode));
           }
+          if (row.pct >= 0 && vent_pct_)        vent_pct_->publish_state((float) row.pct);
+          if (row.countdown >= 0 && countdown_) countdown_->publish_state((float) row.countdown);
+        } else if (Zone *z = find_zone_(node)) {
+          update_zone_(*z, parse_network_row(line));
         }
       }
       return;
@@ -880,9 +931,9 @@ class DucoGateway : public Component, public uart::UARTDevice {
   }
 
   // ── Network header parser ─────────────────────────────────────────────────
-  // Finds column positions of stat / %dbt / cval / cntdwn in the pipe-delimited header
+  // Finds column positions of stat / %dbt / cval / cntdwn / ovrl in the pipe-delimited header
   void parse_network_header(const char *line) {
-    col_stat_ = col_dbt_ = col_cval_ = col_cntdwn_ = 255;
+    col_stat_ = col_dbt_ = col_cval_ = col_cntdwn_ = col_ovrl_ = 255;
 
     // The header starts with the node column. If it doesn't, the start of the
     // reply was lost (e.g. serial buffer overflow) and every column index would
@@ -902,11 +953,12 @@ class DucoGateway : public Component, public uart::UARTDevice {
       if (strstr(tok, "%dbt"))   col_dbt_    = col;
       if (strstr(tok, "cval"))   col_cval_   = col;
       if (strstr(tok, "cntdwn")) col_cntdwn_ = col;
+      if (strstr(tok, "ovrl"))   col_ovrl_   = col;
       col++;
       tok = strtok(nullptr, "|");
     }
-    ESP_LOGD(TAG, "Network header: stat=%d dbt=%d cval=%d cntdwn=%d",
-             col_stat_, col_dbt_, col_cval_, col_cntdwn_);
+    ESP_LOGD(TAG, "Network header: stat=%d dbt=%d cval=%d cntdwn=%d ovrl=%d",
+             col_stat_, col_dbt_, col_cval_, col_cntdwn_, col_ovrl_);
 
     if (log_all_nodes_active_) {
       ESP_LOGI(TAG, "==== Duco Node List (Network) ====");
@@ -914,9 +966,8 @@ class DucoGateway : public Component, public uart::UARTDevice {
   }
 
   // ── Network data row parser ───────────────────────────────────────────────
-  // Publishes the row's stat / %dbt / cntdwn to the given targets (any may be nullptr)
-  void parse_network_row(const char *line, sensor::Sensor *mode_sensor, text_sensor::TextSensor *mode_txt,
-                         sensor::Sensor *pct_sensor, sensor::Sensor *countdown_sensor) {
+  NetworkRow parse_network_row(const char *line) {
+    NetworkRow row;
     char buf[256];
     strncpy(buf, line, sizeof(buf)-1);
     buf[sizeof(buf)-1] = '\0';
@@ -929,18 +980,14 @@ class DucoGateway : public Component, public uart::UARTDevice {
       while (end > tok && *end == ' ') { *end = '\0'; end--; }
 
       if (col == col_stat_ && col_stat_ != 255) {
-        int mode = vent_mode_from_str(tok);
-        ESP_LOGD(TAG, "Network stat=\"%s\" -> %d", tok, mode);
-        if (mode >= 0) {
-          if (mode_sensor) mode_sensor->publish_state((float)mode);
-          if (mode_txt)    mode_txt->publish_state(vent_mode_to_str(mode));
-        }
+        row.mode = vent_mode_from_str(tok);
+        ESP_LOGD(TAG, "Network stat=\"%s\" -> %d", tok, row.mode);
       }
       if (col == col_dbt_ && col_dbt_ != 255) {
         int v = 0;
         if (sscanf(tok, "%d", &v) == 1) {
           ESP_LOGD(TAG, "Network %%dbt=%d", v);
-          if (pct_sensor) pct_sensor->publish_state((float)v);
+          row.pct = v;
         }
       }
       if (col == col_cval_ && col_cval_ != 255) {
@@ -955,11 +1002,115 @@ class DucoGateway : public Component, public uart::UARTDevice {
         int v = 0;
         if (sscanf(tok, "%d", &v) == 1) {
           ESP_LOGD(TAG, "Network cntdwn=%d", v);
-          if (countdown_sensor) countdown_sensor->publish_state((float)v);
+          row.countdown = v;
         }
+      }
+      if (col == col_ovrl_ && col_ovrl_ != 255) {
+        int v = 0;
+        if (sscanf(tok, "%d", &v) == 1) row.ovrl = v;
       }
       col++;
       tok = strtok(nullptr, "|");
+    }
+    return row;
+  }
+
+  // ── Zones ─────────────────────────────────────────────────────────────────
+  Zone *find_zone_(uint8_t node) {
+    for (uint8_t i = 0; i < zone_count_; i++)
+      if (zones_[i].node == node) return &zones_[i];
+    return nullptr;
+  }
+
+  Zone *find_or_add_zone_(uint8_t node) {
+    if (Zone *z = find_zone_(node)) return z;
+    if (zone_count_ >= MAX_ZONES) {
+      ESP_LOGE(TAG, "Too many zones (max %u); ignoring node %u", MAX_ZONES, node);
+      return nullptr;
+    }
+    Zone &z = zones_[zone_count_++];
+    z.node = node;
+    return &z;
+  }
+
+  void start_zone_override_timer_(Zone &z) {
+    z.override_start_ms = millis();
+    z.override_ms = (uint32_t) (z.manual_timeout_min != 0 ? z.manual_timeout_min : 15) * 60000UL;
+  }
+
+  uint32_t zone_override_remaining_s_(const Zone &z) const {
+    uint32_t elapsed = millis() - z.override_start_ms;
+    return elapsed >= z.override_ms ? 0 : (z.override_ms - elapsed + 999) / 1000;
+  }
+
+  void queue_zone_override_(uint8_t node, uint8_t value) {
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "NodeSetOverrule %u %u", node, value);
+    if (!queue_set_(cmd, GROUP_POLL)) return;
+    if (Zone *z = find_zone_(node)) z->write_pending = true;
+  }
+
+  // End overrides set from here once their manual timeout has passed (like a wall controller)
+  void check_zone_overrides_() {
+    for (uint8_t i = 0; i < zone_count_; i++) {
+      Zone &z = zones_[i];
+      if (z.override_ms == 0 || (millis() - z.override_start_ms) < z.override_ms) continue;
+      z.override_ms = 0;
+      ESP_LOGI(TAG, "Zone %u: override timed out, back to auto", z.node);
+      queue_zone_override_(z.node, ZONE_OVERRIDE_NONE);
+    }
+  }
+
+  void update_zone_(Zone &z, const NetworkRow &row) {
+    bool overridden = row.ovrl >= 0 && row.ovrl != ZONE_OVERRIDE_NONE;
+
+    // Rows read while a write for this zone is still queued show the old state; skip them here
+    if (z.control != nullptr && !z.write_pending) {
+      if (overridden && z.override_ms == 0) {
+        // An override this gateway doesn't know about (e.g. set before a reboot):
+        // give it the zone's manual timeout from now, so it can't stay on forever.
+        ESP_LOGI(TAG, "Zone %u: found override of %d%%; ending it after the manual timeout", z.node, row.ovrl);
+        start_zone_override_timer_(z);
+      } else if (!overridden && row.ovrl >= 0 && z.override_ms != 0) {
+        z.override_ms = 0;  // ended elsewhere
+      }
+    }
+
+    if (z.mode != nullptr) {
+      if (overridden) {
+        z.mode->publish_state("EXTN");  // the box's own term; its stat column stays AUTO
+      } else if (row.mode >= 0) {
+        z.mode->publish_state(vent_mode_to_str(row.mode));
+      }
+    }
+    if (row.pct >= 0 && z.percentage != nullptr) z.percentage->publish_state((float) row.pct);
+    if (z.countdown != nullptr && (row.countdown >= 0 || z.override_ms != 0)) {
+      uint32_t cd = row.countdown > 0 ? (uint32_t) row.countdown : 0;
+      if (z.override_ms != 0) cd = std::max(cd, zone_override_remaining_s_(z));
+      z.countdown->publish_state((float) cd);
+    }
+
+    if (z.control != nullptr && !z.write_pending) {
+      size_t idx = 0;  // Auto
+      if (overridden) {
+        // Nearest of the zone's speed levels
+        int best = 1 << 30;
+        for (size_t i = 0; i < 3; i++) {
+          int level = z.levels[i] != 0 ? z.levels[i] : ZONE_DEFAULT_LEVELS[i];
+          if (abs(level - row.ovrl) < best) {
+            best = abs(level - row.ovrl);
+            idx = i + 1;
+          }
+        }
+      } else if (row.mode == 1 || row.mode == 11) {
+        idx = 1;  // MAN1 / CNT1 from a wall controller
+      } else if (row.mode == 2 || row.mode == 12) {
+        idx = 2;
+      } else if (row.mode == 3 || row.mode == 13) {
+        idx = 3;
+      }
+      auto current = z.control->active_index();
+      if (!current.has_value() || current.value() != idx) z.control->publish_state(idx);
     }
   }
 
@@ -1030,7 +1181,15 @@ class DucoGateway : public Component, public uart::UARTDevice {
       case PH_SET:
         settling_ = true;
         settle_start_ms_ = millis();
-        if (set_group_ != GROUP_NONE) settings_pending_ |= (1u << set_group_);
+        if (set_group_ == GROUP_POLL) {
+          last_poll_ms_ = millis() - poll_interval_ms_;  // read the Network table right after settling
+          unsigned node = 0;
+          if (sscanf(set_cmd_, "NodeSetOverrule %u", &node) == 1) {
+            if (Zone *z = find_zone_(node)) z->write_pending = false;
+          }
+        } else if (set_group_ != GROUP_NONE) {
+          settings_pending_ |= (1u << set_group_);
+        }
         phase_ = PH_IDLE;
         break;
 
@@ -1193,29 +1352,38 @@ class DucoGateway : public Component, public uart::UARTDevice {
       ESP_LOGD(TAG, "Setting node %u param %u = %d", node, param, value);
       n.number->publish_state(value * n.scale);
     }
+
+    // Speed levels and manual timeout of a zone with a zone_ventilation select
+    Zone *z = source == SETTING_NODE_CONFIG ? find_zone_(node) : nullptr;
+    if (z != nullptr) {
+      if (param >= 7 && param <= 9 && value > 0 && value <= 100) z->levels[param - 7] = (uint8_t) value;
+      if (param == 10 && value > 0) z->manual_timeout_min = (uint16_t) value;
+    }
   }
 
   // ── Settings: writes ──────────────────────────────────────────────────────
   // Queue a *Set command. A pending write for the same setting (same text up to
   // the last space, e.g. "NodeConfigSet 3 4 ") is replaced instead of queued again.
-  void queue_set_(const char *cmd, uint8_t group) {
+  // Returns false if the queue was full and the write was dropped.
+  bool queue_set_(const char *cmd, uint8_t group) {
     const char *last_space = strrchr(cmd, ' ');
     size_t key_len = last_space != nullptr ? (size_t) (last_space - cmd + 1) : strlen(cmd);
     for (uint8_t i = 0; i < set_count_; i++) {
       QueuedSet &q = set_queue_[(set_head_ + i) % SET_QUEUE_SIZE];
       if (strncmp(q.cmd, cmd, key_len) == 0) {
         snprintf(q.cmd, sizeof(q.cmd), "%s", cmd);
-        return;
+        return true;
       }
     }
     if (set_count_ >= SET_QUEUE_SIZE) {
       ESP_LOGW(TAG, "Settings queue full; dropping \"%s\"", cmd);
-      return;
+      return false;
     }
     QueuedSet &q = set_queue_[(set_head_ + set_count_) % SET_QUEUE_SIZE];
     snprintf(q.cmd, sizeof(q.cmd), "%s", cmd);
     q.group = group;
     set_count_++;
+    return true;
   }
 
   void send_next_set_() {
@@ -1231,6 +1399,7 @@ class DucoGateway : public Component, public uart::UARTDevice {
     }
 #endif
     set_group_ = q.group;
+    snprintf(set_cmd_, sizeof(set_cmd_), "%s", cmd);
     set_head_ = (set_head_ + 1) % SET_QUEUE_SIZE;
     set_count_--;
 
@@ -1266,8 +1435,19 @@ class DucoNumber : public number::Number, public Parented<DucoGateway> {
 };
 
 class DucoSelect : public select::Select, public Parented<DucoGateway> {
+ public:
+  void set_zone(uint8_t node) { zone_node_ = node; }
+
  protected:
-  void control(size_t index) override { this->parent_->write_bypass_mode(index); }
+  void control(size_t index) override {
+    if (zone_node_ == 0) {
+      this->parent_->write_bypass_mode(index);
+    } else {
+      this->parent_->write_zone_control(zone_node_, index);
+    }
+  }
+
+  uint8_t zone_node_{0};  // 0 = bypass_mode, otherwise zone_ventilation for this zone valve node
 };
 
 }  // namespace duco_gateway
