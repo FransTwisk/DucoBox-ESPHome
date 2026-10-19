@@ -444,7 +444,7 @@ class DucoRF : public Component, public cc1101::CC1101Listener {
   void flush_rf_log_() {
     uint8_t n = rf_.getNumberOfLogMessages();
     for (uint8_t i = 0; i < n; i++) {
-      ESP_LOGD(TAG, rf_.logMessages[i]);
+      ESP_LOGD(TAG, "%s", rf_.logMessages[i]);
     }
   }
 };
