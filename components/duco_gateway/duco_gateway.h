@@ -1116,11 +1116,11 @@ class DucoGateway : public Component, public uart::UARTDevice {
   }
 
   // The switch is on while the zone's setting stays until changed: an override kept
-  // from here, or a wall controller's permanent mode (CNT1-3).
+  // from here, or a wall controller's permanent mode (CNT1-3). Always published, also
+  // when off (the switch drops repeats itself), so it has a state from the start.
   void publish_zone_permanent_(Zone &z) {
     if (z.permanent_switch == nullptr) return;
-    bool on = z.permanent || z.controller_permanent;
-    if (z.permanent_switch->state != on) z.permanent_switch->publish_state(on);
+    z.permanent_switch->publish_state(z.permanent || z.controller_permanent);
   }
 
   // End overrides set from here once their manual timeout has passed (like a wall controller)
