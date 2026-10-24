@@ -5,7 +5,7 @@ from esphome.components import time as time_
 from esphome.const import CONF_CO2, CONF_HUMIDITY, CONF_ID, CONF_TEMPERATURE, CONF_TIME_ID
 
 DEPENDENCIES = ["uart"]
-AUTO_LOAD = ["sensor", "text_sensor", "binary_sensor", "number", "select"]
+AUTO_LOAD = ["sensor", "text_sensor", "binary_sensor", "number", "select", "switch"]
 
 duco_gateway_ns = cg.esphome_ns.namespace("duco_gateway")
 DucoGateway = duco_gateway_ns.class_("DucoGateway", cg.Component, uart.UARTDevice)

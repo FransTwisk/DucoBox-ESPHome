@@ -163,6 +163,7 @@ number:
 |---|---|---|---|
 | select `bypass_mode` | – | `BypassParaSet 0 <n>` | `Auto`, `Closed (heat recovery)`, `Open (bypass)` |
 | select `zone_ventilation` | `node` (zone valve) | `NodeSetOverrule <node> <%>` | `Auto`, `Min`, `Med`, `Max`: see below |
+| switch `zone_permanent` | `node` (zone valve) | – (keeps the override) | on / off: see below |
 | number `co2_setpoint` | `node` | `NodeConfigSet <node> 4` | 400–2000 ppm |
 | number `comfort_temperature` | `zone` (1 or 2) | `SettingsParaSet 5/6` | 15–30 °C |
 | number `manual_1`, `manual_2`, `manual_3` | `node` | `NodeConfigSet <node> 7/8/9` | % for speed 1 (0–50), 2 (15–100), 3 (50–100) |
@@ -170,7 +171,7 @@ number:
 | number `auto_min`, `auto_max` | `node` | `NodeConfigSet <node> 1/2` | 10–100 %: range in automatic mode |
 
 ### Ventilation per zone
-The ESP is paired as a remote for the whole box, so its RF commands (and the fan / select in your configuration that send them) set the ventilation of the box: every zone runs at the box's level, while each zone's own mode stays `AUTO`. A wall controller in a room sets only its own zone (`MAN1`–`MAN3` in that zone's row of the `Network` table); the box then runs at the average of the zones. On a box with two zone valves of the same capacity, the box's `%dbt` was always exactly that average: 10 % + 10 % → 10 %, 10 % + 100 % → 55 %, 10 % + 50 % → 30 %.
+The ESP is paired as a remote for the whole box, so its RF commands (and the fan / select in your configuration that send them) set the ventilation of the box: every zone runs at the box's level, while each zone's own mode stays `AUTO`. A wall controller in a room sets only its own zone (`MAN1`–`MAN3` in that zone's row of the `Network` table, or `CNT1`–`CNT3` when set permanently); the box then runs at the average of the zones. On a box with two zone valves of the same capacity, the box's `%dbt` was always exactly that average: 10 % + 10 % → 10 %, 10 % + 100 % → 55 %, 10 % + 50 % → 30 %.
 
 To set a single zone from Home Assistant, add a `zone_ventilation` select per zone valve:
 
@@ -185,6 +186,18 @@ select:
 `Min`, `Med` and `Max` override the zone with its own speed 1/2/3 level (read from the zone with `NodeConfigGet`, e.g. 10/50/100 %), using `NodeSetOverrule <node> <%>`. The box itself has no time limit on such an override, so the gateway ends it like a wall controller does: after the zone's manual timeout (`NodeConfigGet` param 10, e.g. 15 min), it sends `NodeSetOverrule <node> 255` (no override). The zone's `countdown` sensor shows the time left, and choosing the same level again restarts it. `Auto` ends the override right away. If the gateway finds an override it didn't set (for example one left from before the ESP restarted), it ends that one after the manual timeout too. While an override is active, the zone's mode shows `EXTN` (the box shows that in the row's info column; its `stat` stays `AUTO`), and the select shows the nearest level. The select also shows `Min`/`Med`/`Max` while a wall controller has set that zone.
 
 `Auto` only ends an override set with `NodeSetOverrule`; it doesn't cancel a speed chosen on a wall controller.
+
+To keep a zone's speed until you change it, add a `zone_permanent` switch for the zone valve:
+
+```yaml
+switch:
+  - platform: duco_gateway
+    type: zone_permanent
+    node: 67                    # zone valve (VLV) of the bedroom
+    name: "Bedroom Ventilation Permanent"
+```
+
+Like the box's permanent mode, it applies to the current `Min`, `Med` or `Max`: choose the speed with the `zone_ventilation` select, then turn the switch on, and the gateway no longer ends the override after the manual timeout. A speed chosen while the switch is on stays too. Turning it off starts the manual timeout from that moment; `Auto` ends the override and turns the switch off. In `Auto` there is nothing to keep, so turning the switch on has no effect. The gateway remembers the switch across an ESP restart (in the ESP's preferences), so a permanent override it finds after a restart isn't ended; if the override was ended elsewhere in the meantime, the switch turns off. The switch is also on while a wall controller has set the zone permanently (`CNT1`–`CNT3`); that mode can only be ended on the controller.
 
 `Closed (heat recovery)` keeps the bypass closed so all air passes the heat exchanger; `Open (bypass)` opens it fully. In `Auto` the box moves the bypass gradually (about 5 % every 2 minutes), so it can take a while to settle after switching back.
 

@@ -7,7 +7,9 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/number/number.h"
 #include "esphome/components/select/select.h"
+#include "esphome/components/switch/switch.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
 #ifdef USE_TIME
 #include "esphome/components/time/real_time_clock.h"
 #endif
@@ -83,11 +85,16 @@ struct Zone {
   sensor::Sensor          *percentage {nullptr};
   sensor::Sensor          *countdown  {nullptr};  // seconds left of a manual mode
   select::Select          *control    {nullptr};  // Auto / Min / Med / Max (NodeSetOverrule)
+  switch_::Switch         *permanent_switch {nullptr};  // keep the override until changed
   uint8_t                  levels[3]  {0, 0, 0};  // Manual 1/2/3 % (NodeConfig 7/8/9), 0 = not read yet
   uint16_t                 manual_timeout_min {0};  // NodeConfig 10, 0 = not read yet
   uint32_t                 override_start_ms  {0};
   uint32_t                 override_ms        {0};  // Override set from here runs this long; 0 = none
   bool                     write_pending      {false};  // NodeSetOverrule queued, not yet sent
+  bool                     permanent          {false};  // the override isn't ended after the manual timeout
+  bool                     overridden         {false};  // last Network row had an override (ovrl)
+  bool                     controller_permanent {false};  // last Network row had CNT1-3 (wall controller)
+  ESPPreferenceObject      permanent_pref;  // keeps `permanent` across an ESP restart
 };
 
 static constexpr uint8_t ZONE_OVERRIDE_NONE = 255;              // NodeSetOverrule value / ovrl column: no override
@@ -309,12 +316,52 @@ class DucoGateway : public Component, public uart::UARTDevice {
     if (z == nullptr || index > 3) return;
     if (index == 0) {
       z->override_ms = 0;
+      set_zone_permanent_(*z, false);
+      publish_zone_permanent_(*z);
       queue_zone_override_(node, ZONE_OVERRIDE_NONE);
       return;
     }
     uint8_t level = z->levels[index - 1] != 0 ? z->levels[index - 1] : ZONE_DEFAULT_LEVELS[index - 1];
-    start_zone_override_timer_(*z);
+    if (z->permanent) {
+      z->override_ms = 0;  // stays until changed
+    } else {
+      start_zone_override_timer_(*z);
+    }
     queue_zone_override_(node, level);
+  }
+
+  // Zone permanent switch (zone_permanent): keeps the zone's override until it's changed,
+  // instead of ending it after the zone's manual timeout. Like the box's permanent mode,
+  // it applies to the current Min / Med / Max: in Auto there is nothing to keep.
+  void add_zone_permanent(uint8_t node, switch_::Switch *s) {
+    Zone *z = find_or_add_zone_(node);
+    if (z == nullptr) return;
+    z->permanent_switch = s;
+  }
+
+  void write_zone_permanent(uint8_t node, bool on) {
+    Zone *z = find_zone_(node);
+    if (z == nullptr) return;
+    bool override_active = z->overridden || z->override_ms != 0;
+    if (on) {
+      if (override_active) {
+        set_zone_permanent_(*z, true);
+        z->override_ms = 0;
+        ESP_LOGI(TAG, "Zone %u: override kept until changed", node);
+      } else if (!z->controller_permanent) {
+        ESP_LOGW(TAG, "Zone %u: nothing to keep; choose Min, Med or Max for the zone first", node);
+      }
+    } else {
+      set_zone_permanent_(*z, false);
+      if (override_active && z->override_ms == 0) {
+        start_zone_override_timer_(*z);
+        ESP_LOGI(TAG, "Zone %u: override ends after the manual timeout", node);
+      }
+      if (z->controller_permanent) {
+        ESP_LOGW(TAG, "Zone %u: permanent mode was set on a wall controller; end it there", node);
+      }
+    }
+    publish_zone_permanent_(*z);
   }
 
   // Request an immediate network dump with all discovered nodes in logs.
@@ -354,6 +401,18 @@ class DucoGateway : public Component, public uart::UARTDevice {
 
   void setup() override {
     ESP_LOGI(TAG, "DucoGateway setup()");
+
+    // Zone permanent flags survive an ESP restart, so a permanent override found
+    // in the first Network table isn't ended after the manual timeout.
+    for (uint8_t i = 0; i < zone_count_; i++) {
+      Zone &z = zones_[i];
+      if (z.permanent_switch == nullptr) continue;
+      z.permanent_pref = global_preferences->make_preference<bool>(
+          fnv1_hash_extend(fnv1_hash("duco_zone_permanent"), z.node));
+      bool on = false;
+      if (z.permanent_pref.load(&on)) z.permanent = on;
+      publish_zone_permanent_(z);
+    }
 
     delay(200);
     flush_rx();
@@ -1050,6 +1109,20 @@ class DucoGateway : public Component, public uart::UARTDevice {
     if (Zone *z = find_zone_(node)) z->write_pending = true;
   }
 
+  void set_zone_permanent_(Zone &z, bool on) {
+    if (z.permanent == on) return;
+    z.permanent = on;
+    z.permanent_pref.save(&z.permanent);
+  }
+
+  // The switch is on while the zone's setting stays until changed: an override kept
+  // from here, or a wall controller's permanent mode (CNT1-3).
+  void publish_zone_permanent_(Zone &z) {
+    if (z.permanent_switch == nullptr) return;
+    bool on = z.permanent || z.controller_permanent;
+    if (z.permanent_switch->state != on) z.permanent_switch->publish_state(on);
+  }
+
   // End overrides set from here once their manual timeout has passed (like a wall controller)
   void check_zone_overrides_() {
     for (uint8_t i = 0; i < zone_count_; i++) {
@@ -1066,14 +1139,23 @@ class DucoGateway : public Component, public uart::UARTDevice {
 
     // Rows read while a write for this zone is still queued show the old state; skip them here
     if (z.control != nullptr && !z.write_pending) {
-      if (overridden && z.override_ms == 0) {
+      if (overridden && z.override_ms == 0 && !z.permanent) {
         // An override this gateway doesn't know about (e.g. set before a reboot):
         // give it the zone's manual timeout from now, so it can't stay on forever.
         ESP_LOGI(TAG, "Zone %u: found override of %d%%; ending it after the manual timeout", z.node, row.ovrl);
         start_zone_override_timer_(z);
-      } else if (!overridden && row.ovrl >= 0 && z.override_ms != 0) {
+      } else if (!overridden && row.ovrl >= 0) {
         z.override_ms = 0;  // ended elsewhere
+        if (z.permanent) {
+          ESP_LOGI(TAG, "Zone %u: override ended elsewhere, no longer permanent", z.node);
+          set_zone_permanent_(z, false);
+        }
       }
+    }
+    if (!z.write_pending) {
+      if (row.ovrl >= 0) z.overridden = overridden;
+      if (row.mode >= 0) z.controller_permanent = row.mode >= 11 && row.mode <= 13;  // CNT1-3
+      publish_zone_permanent_(z);
     }
 
     if (z.mode != nullptr) {
@@ -1448,6 +1530,18 @@ class DucoSelect : public select::Select, public Parented<DucoGateway> {
   }
 
   uint8_t zone_node_{0};  // 0 = bypass_mode, otherwise zone_ventilation for this zone valve node
+};
+
+// Switch entity (platform switch.py): zone_permanent for one zone valve. Its state is
+// only published by the gateway, from what the box reports.
+class DucoSwitch : public switch_::Switch, public Parented<DucoGateway> {
+ public:
+  void set_zone(uint8_t node) { zone_node_ = node; }
+
+ protected:
+  void write_state(bool state) override { this->parent_->write_zone_permanent(zone_node_, state); }
+
+  uint8_t zone_node_{0};
 };
 
 }  // namespace duco_gateway
